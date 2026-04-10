@@ -54,6 +54,47 @@ The upstream project exposes the Codex app-server as a single browser-accessible
 
 ---
 
+## Prerequisites
+
+Before installing this project, you need profiles already created by [codex-auth-launcher](https://github.com/tinywind/codex-auth-launcher).
+
+### 1. codex-auth-launcher
+
+`codex-auth-launcher` manages per-auth-file isolated `CODEX_HOME` directories. This project reads those directories directly — it does not create them.
+
+Install it first:
+
+```bash
+git clone https://github.com/tinywind/codex-auth-launcher
+bash codex-auth-launcher/install-bashrc-command.sh
+source ~/.bashrc
+```
+
+### 2. Create at least one profile
+
+Use `codex-auth` to bootstrap a profile for each auth file you want to run as a separate instance:
+
+```bash
+# First use: bootstrap profile home from ~/.codex and link the auth file
+codex-auth --profile myprofile --cred-file /path/to/auth.json login status
+```
+
+This creates:
+
+```text
+~/.codex-auth-launcher/profiles/myprofile/
+├── profile.json
+└── codex-home/
+    ├── auth.json -> /path/to/auth.json   # symlink
+    └── ...                               # bootstrapped from ~/.codex
+```
+
+Repeat for each account. After this step, `codex-web-auth start-folder` can pick up and serve all profiles.
+
+> For full `codex-auth-launcher` usage (named profiles, resync, reset, shared paths), see its [README](https://github.com/tinywind/codex-auth-launcher).
+
+---
+
 ## Installation
 
 **Step 1 — Build and install `codexui` globally:**
