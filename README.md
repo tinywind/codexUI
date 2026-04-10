@@ -1,256 +1,208 @@
-# 🔥 codexapp
+# codexUI — Multi-Profile Fork
 
-### 🚀 Run Codex App UI Anywhere: Linux, Windows, or Termux on Android 🚀
+This is a personal fork of [codexapp](https://www.npmjs.com/package/codexapp) (originally by Pavel Voronin / Igor Levochkin).
 
-[![npm](https://img.shields.io/npm/v/codexapp?style=for-the-badge&logo=npm&logoColor=white)](https://www.npmjs.com/package/codexapp)
-[![platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Windows%20%7C%20Android-blue?style=for-the-badge)](#-quick-start)
-[![node](https://img.shields.io/badge/Node-18%2B-339933?style=for-the-badge&logo=node.js&logoColor=white)](https://nodejs.org/)
-[![license](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](./LICENSE)
+The upstream project exposes the Codex app-server as a single browser-accessible UI. This fork adds **multi-profile, multi-account management** on top of that, with full isolation of each profile's data, auth, and sessions under a dedicated `CODEX_HOME` directory.
 
-> **Codex UI in your browser. No drama. One command.**
->  
-> **Yes, that is your Codex desktop app experience exposed over web UI. Yes, it runs cross-platform.**
+---
+
+## What Is Different From Upstream
+
+| Concern | Upstream | This Fork |
+|---|---|---|
+| Auth | Single account via `codex login` | Multiple accounts, each with its own `auth.json` source |
+| Data isolation | `~/.codex` shared by all | Per-profile `CODEX_HOME` under `~/.codex-auth-launcher/profiles/` |
+| Session storage | Single namespace | Profile-scoped: sessions, accounts, global state all under CODEX_HOME |
+| Running instances | One process | One process per profile, each on its own port |
+| Startup management | `npx codexapp` | `codex-web-auth start-folder` or systemd user service |
+
+---
+
+## Directory Layout
 
 ```text
- ██████╗ ██████╗ ██████╗ ███████╗██╗  ██╗██╗   ██╗██╗
-██╔════╝██╔═══██╗██╔══██╗██╔════╝╚██╗██╔╝██║   ██║██║
-██║     ██║   ██║██║  ██║█████╗   ╚███╔╝ ██║   ██║██║
-██║     ██║   ██║██║  ██║██╔══╝   ██╔██╗ ██║   ██║██║
-╚██████╗╚██████╔╝██████╔╝███████╗██╔╝ ██╗╚██████╔╝██║
- ╚═════╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═╝
+~/.codex-auth-launcher/
+├── profiles/
+│   ├── <profile-name>/
+│   │   ├── profile.json          # Profile config
+│   │   └── codex-home/           # Isolated CODEX_HOME for this profile
+│   │       ├── auth.json         # Symlink → authSource
+│   │       ├── sessions/         # Session files (YYYY/MM/DD/)
+│   │       ├── session_index.jsonl
+│   │       ├── accounts/
+│   │       └── .codex-global-state.json
+│   └── ...
+└── services/                     # PID / log / meta files (managed automatically)
+```
+
+### profile.json
+
+```json
+{
+  "profileName": "example",
+  "codexHome": "/home/user/.codex-auth-launcher/profiles/example/codex-home",
+  "authSource": "/path/to/actual/auth.json",
+  "authLink": "/home/user/.codex-auth-launcher/profiles/example/codex-home/auth.json",
+  "baseHome": null,
+  "bootstrapHome": "/home/user/.codex",
+  "bootstrappedOnFirstUse": false,
+  "sharedPaths": []
+}
+```
+
+`authSource` can be a file or a directory containing `auth.json`. On start, `sync-auth.sh` creates `authLink` as a symlink pointing to the resolved source file.
+
+---
+
+## Installation
+
+**Step 1 — Build and install `codexui` globally:**
+
+```bash
+git clone <this-repo>
+cd codexUI
+pnpm install
+pnpm run build
+npm install -g .
+```
+
+**Step 2 — Install the `codex-web-auth` management command:**
+
+```bash
+bash scripts/auth-launcher/install.sh
+```
+
+This installs:
+- `~/.local/bin/codex-web-auth` — CLI entry point
+- `~/.config/systemd/user/codex-web-auth.service` — systemd user service (enabled, not started)
+
+Make sure `~/.local/bin` is on your `PATH`.
+
+---
+
+## Creating a Profile
+
+Create the directory structure manually:
+
+```bash
+mkdir -p ~/.codex-auth-launcher/profiles/myprofile/codex-home
+
+cat > ~/.codex-auth-launcher/profiles/myprofile/profile.json <<'EOF'
+{
+  "profileName": "myprofile",
+  "codexHome": "/home/user/.codex-auth-launcher/profiles/myprofile/codex-home",
+  "authSource": "/path/to/auth.json",
+  "authLink": "/home/user/.codex-auth-launcher/profiles/myprofile/codex-home/auth.json",
+  "baseHome": null,
+  "bootstrapHome": "/home/user/.codex",
+  "bootstrappedOnFirstUse": false,
+  "sharedPaths": []
+}
+EOF
 ```
 
 ---
 
-## 🤯 What Is This?
-**`codexapp`** is a lightweight bridge that gives you a browser-accessible UI for Codex app-server workflows.
+## Usage
 
-You run one command. It starts a local web server. You open it from your machine, your LAN, or wherever your setup allows.  
+### Start / stop individual profile
 
-**TL;DR 🧠: Codex app UI, unlocked for Linux, Windows, and Termux-powered Android setups.**
+```bash
+codex-web-auth start   myprofile --port 8051
+codex-web-auth stop    myprofile
+codex-web-auth restart myprofile
+```
+
+### Start / stop all profiles in a folder
+
+```bash
+# Start all profiles under ~/.codex-auth-launcher/profiles (ports assigned from 8051)
+codex-web-auth start-folder
+
+# With explicit folder and port start
+codex-web-auth start-folder ~/.codex-auth-launcher/profiles --port-start 8060
+
+# Stop / restart all
+codex-web-auth stop-folder
+codex-web-auth restart-folder
+```
+
+### Status and logs
+
+```bash
+codex-web-auth status
+codex-web-auth status-folder
+codex-web-auth logs myprofile
+codex-web-auth logs myprofile 100
+```
+
+### Auth sync
+
+Recreates `auth.json` symlink from `authSource`. Runs automatically on start.
+
+```bash
+codex-web-auth sync myprofile
+codex-web-auth sync-folder
+```
+
+### systemd (auto-start on login)
+
+```bash
+systemctl --user start   codex-web-auth   # start all profiles now
+systemctl --user stop    codex-web-auth
+systemctl --user status  codex-web-auth
+journalctl --user -u codex-web-auth -f    # follow logs
+```
+
+The install script enables the unit automatically. To enable manually:
+
+```bash
+systemctl --user enable codex-web-auth
+```
 
 ---
 
-## ⚡ Quick Start
-> **The main event.**
+## Updating
+
+After pulling changes and rebuilding:
 
 ```bash
-# 🔓 Run instantly (recommended)
-npx codexapp
-
-# 🌐 Then open in browser
-# http://localhost:18923
+git pull
+pnpm install
+pnpm run build
+npm install -g .
+codex-web-auth restart-folder
 ```
-
-By default, `codexapp` now also starts:
-
-```bash
-cloudflared tunnel --url http://localhost:<port>
-```
-
-It prints the tunnel URL, terminal QR code, and password together in startup output.  
-Use `--no-tunnel` to disable this behavior.
-
-If you are using a provider or AI gateway that is already authenticated and do not want `codexapp` to force `codex login` during startup, use:
-
-```bash
-npx codexapp --no-login
-```
-
-### Linux 🐧
-```bash
-node -v   # should be 18+
-npx codexapp
-```
-
-### Windows 🪟 (PowerShell)
-```powershell
-node -v   # 18+
-npx codexapp
-```
-
-### Termux (Android) 🤖
-```bash
-pkg update && pkg upgrade -y
-pkg install nodejs -y
-npx codexapp
-```
-
-Android background requirements:
-
-1. Keep `codexapp` running in the current Termux session (do not close it).
-2. In Android settings, disable battery optimization for `Termux`.
-3. Keep the persistent Termux notification enabled so Android is less likely to kill it.
-4. Optional but recommended in Termux:
-```bash
-termux-wake-lock
-```
-5. Open the shown URL in your Android browser. If the app is killed, return to Termux and run `npx codexapp` again.
 
 ---
 
-## iPhone / iPad via Tailscale Serve
-
-If you want to use codexUI from iPhone or iPad Safari, serving it over HTTPS is recommended.
-
-A practical private setup is to run codexUI locally and publish it inside your tailnet with Tailscale Serve:
-
-```powershell
-npx codexapp --no-tunnel --port 5900
-tailscale serve --bg 5900
-```
-
-Then open:
+## Architecture
 
 ```text
-https://<your-machine>.<your-tailnet>.ts.net
+~/.codex-auth-launcher/profiles/
+  profile-a/           profile-b/           profile-c/
+  └─ codex-home/       └─ codex-home/       └─ codex-home/
+       CODEX_HOME=↑         CODEX_HOME=↑         CODEX_HOME=↑
+           │                    │                    │
+      codexui :8051        codexui :8052        codexui :8053
+           │                    │                    │
+     Browser tab          Browser tab          Browser tab
 ```
 
-This setup worked well in practice for:
-
-- iPhone Safari access
-- Add to Home Screen
-- the built-in dictation / transcription feature in the app
-- viewing the same projects and conversations from the Windows host
-
-Notes:
-
-- Tailscale Serve keeps access private to your tailnet
-- on iOS, HTTPS / secure context appears to be important for mobile browser access and dictation
-- some minor mobile Safari CSS issues may still exist, but they do not prevent normal use
-- depending on proxying details, authentication behavior may differ from direct remote access
-- if conversations created in the web UI do not immediately appear in the Windows app, restarting the Windows app may refresh them
+Each `codexui` process is started with `CODEX_HOME` set to that profile's directory. Sessions, accounts, and global state are fully isolated. The UI reads `CODEX_HOME` for all data operations and the OS user home only for file-browser navigation.
 
 ---
 
-## ✨ Features
-> **The payload.**
+## Requirements
 
-- 🚀 One-command launch with `npx codexapp`
-- 🌍 Cross-platform support for Linux, Windows, and Termux on Android
-- 🖥️ Browser-first Codex UI flow on `http://localhost:18923`
-- 🌐 LAN-friendly access from other devices on the same network
-- 🧪 Remote/headless-friendly setup for server-based Codex usage
-- 🔌 Works with reverse proxies and tunneling setups
-- ⚡ No global install required for quick experimentation
-- 🎙️ Built-in hold-to-dictate voice input with transcription to composer draft
-- 🤖 Optional Telegram bot bridge: send messages to bot, forward into mapped thread, send assistant reply back to Telegram
-
-### Telegram Bot Bridge (Optional)
-
-Set these environment variables before starting `codexapp`:
-
-```bash
-export TELEGRAM_BOT_TOKEN="<your-telegram-bot-token>"
-export TELEGRAM_DEFAULT_CWD="$PWD" # optional, defaults to current working directory
-npx codexapp
-```
-
-Bot commands:
-
-- `/newthread` create and map a new Codex thread for this Telegram chat
-- `/thread <threadId>` map current Telegram chat to an existing thread
-- Any other text message is forwarded to the mapped thread
+- Node.js 18+
+- Python 3 (for `profile.json` parsing in shell scripts)
+- `pnpm`
+- systemd user session (for the service unit; optional)
 
 ---
 
-## 🧩 Recent Product Features (from main commits)
-> **Not just launch. Actual UX upgrades.**
+## Upstream
 
-- 🗂️ Searchable project picker in new-thread flow
-- ➕ Inline "Add new project" input inside picker (no browser prompt)
-- 📌 New projects get pinned to top automatically
-- 🧠 Smart default new-project name suggestion via server-side free-directory scan (`New Project (N)`)
-- 🔄 Project order persisted globally to workspace roots state
-- 🧵 Optimistic in-progress threads preserved during refresh/poll cycles
-- 📱 Mobile drawer sidebar in desktop layout (teleported overlay + swipe-friendly structure)
-- 🎛️ Skills Hub mobile-friendly spacing/toolbar layout improvements
-- 🪟 Skill detail modal tuned for mobile sheet-style behavior
-- 🧪 Skills Hub event typing fix for `SkillCard` select emit compatibility
-- 🎙️ Voice dictation flow in composer (`hold to dictate` -> transcribe -> append text)
-
----
-
-## 🌍 What Can You Do With This?
-
-| 🔥 Use Case | 💥 What You Get |
-|---|---|
-| 💻 Linux workstation | Run Codex UI in browser without depending on desktop shell |
-| 🪟 Windows machine | Launch web UI and access from Chrome/Edge quickly |
-| 📱 Termux on Android | Start service in Termux and control from mobile browser |
-| 🧪 Remote dev box | Keep Codex process on server, view UI from client device |
-| 🌐 LAN sharing | Open UI from another device on same network |
-| 🧰 Headless workflows | Keep terminal + browser split for productivity |
-| 🔌 Custom routing | Put behind reverse proxy/tunnel if needed |
-| ⚡ Fast experiments | `npx` run without full global setup |
-
----
-
-## 🖼️ Screenshots
-
-### Skills Hub
-![Skills Hub](docs/screenshots/skills-hub.png)
-
-### Chat
-![Chat](docs/screenshots/chat.png)
-
-### Mobile UI
-![Skills Hub Mobile](docs/screenshots/skills-hub-mobile.png)
-![Chat Mobile](docs/screenshots/chat-mobile.png)
-
----
-
-## 🏗️ Architecture
-
-```text
-┌─────────────────────────────┐
-│  Browser (Desktop/Mobile)   │
-└──────────────┬──────────────┘
-               │ HTTP/WebSocket
-┌──────────────▼──────────────┐
-│         codexapp            │
-│  (Express + Vue UI bridge)  │
-└──────────────┬──────────────┘
-               │ RPC/Bridge calls
-┌──────────────▼──────────────┐
-│      Codex App Server       │
-└─────────────────────────────┘
-```
-
----
-
-## 🎯 Requirements
-- ✅ Node.js `18+`
-- ✅ Codex app-server environment available
-- ✅ Browser access to host/port
-- ✅ Microphone permission (only for voice dictation)
-
----
-
-## 🐛 Troubleshooting
-
-| ❌ Problem | ✅ Fix |
-|---|---|
-| Port already in use | Run on a free port or stop old process |
-| `npx` fails | Update npm/node, then retry |
-| Termux install fails | `pkg update && pkg upgrade` then reinstall `nodejs` |
-| Can’t open from other device | Check firewall, bind address, and LAN routing |
-
----
-
-## 🤝 Contributing
-Issues and PRs are welcome.  
-Bring bug reports, platform notes, and setup improvements.
-
----
-
-## ⭐ Star This Repo
-If you believe Codex UI should be accessible from **any machine, any OS, any screen**, star this project and share it. ⭐
-
-<div align="center">
-Built for speed, portability, and a little bit of chaos 😏
-</div>
-
----
-
-Forked from [pavel-voronin/codex-web-local](https://github.com/pavel-voronin/codex-web-local) by Pavel Voronin.
+Forked from [codexapp](https://www.npmjs.com/package/codexapp) by Pavel Voronin / Igor Levochkin.
+Original source: [friuns2/codexui](https://github.com/friuns2/codexui)
