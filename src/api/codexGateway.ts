@@ -1540,7 +1540,7 @@ export async function startThreadReview(
   })
 }
 
-export async function getHomeDirectory(): Promise<string> {
+export async function getHomeDirectory(): Promise<{ path: string; codexHome: string }> {
   const response = await fetch('/codex-api/home-directory')
   const payload = (await response.json()) as unknown
   if (!response.ok) {
@@ -1554,7 +1554,10 @@ export async function getHomeDirectory(): Promise<string> {
     record.data && typeof record.data === 'object' && !Array.isArray(record.data)
       ? (record.data as Record<string, unknown>)
       : {}
-  return typeof data.path === 'string' ? data.path.trim() : ''
+  return {
+    path: typeof data.path === 'string' ? data.path.trim() : '',
+    codexHome: typeof data.codexHome === 'string' ? data.codexHome.trim() : '',
+  }
 }
 
 export async function listLocalDirectories(path: string, options?: { showHidden?: boolean }): Promise<LocalDirectoryListing> {

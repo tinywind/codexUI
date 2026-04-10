@@ -3139,7 +3139,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
       }
 
       if (req.method === 'GET' && url.pathname === '/codex-api/home-directory') {
-        setJson(res, 200, { data: { path: homedir() } })
+        setJson(res, 200, { data: { path: homedir(), codexHome: getCodexHomeDir() } })
         return
       }
 

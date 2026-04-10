@@ -843,6 +843,7 @@ const serverMatchedThreadIds = ref<string[] | null>(null)
 let threadSearchTimer: ReturnType<typeof setTimeout> | null = null
 const defaultNewProjectName = ref('New Project (1)')
 const homeDirectory = ref('')
+const codexHomeDirectory = ref('')
 const isSettingsOpen = ref(false)
 const isAccountsSectionCollapsed = ref(loadAccountsSectionCollapsed())
 const isReviewPaneOpen = ref(false)
@@ -2059,10 +2060,11 @@ async function resolveProjectBaseDirectory(): Promise<string> {
   const baseDir = getProjectBaseDirectory()
   if (baseDir) return baseDir
   try {
-    const loadedHomeDirectory = await getHomeDirectory()
-    if (loadedHomeDirectory) {
-      homeDirectory.value = loadedHomeDirectory
-      return loadedHomeDirectory
+    const loaded = await getHomeDirectory()
+    if (loaded.path) {
+      homeDirectory.value = loaded.path
+      codexHomeDirectory.value = loaded.codexHome
+      return loaded.path
     }
   } catch {
     // Fallback handled by empty return.
@@ -2095,9 +2097,12 @@ function getProjectBaseDirectory(): string {
 
 async function loadHomeDirectory(): Promise<void> {
   try {
-    homeDirectory.value = await getHomeDirectory()
+    const loaded = await getHomeDirectory()
+    homeDirectory.value = loaded.path
+    codexHomeDirectory.value = loaded.codexHome
   } catch {
     homeDirectory.value = ''
+    codexHomeDirectory.value = ''
   }
 }
 
