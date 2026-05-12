@@ -11,6 +11,7 @@ import {
   getPendingServerRequests,
   getSkillsList,
   getThreadDetail,
+  getOlderThreadMessages,
   getBackgroundThreadListLimit,
   interruptThreadTurn,
   pickCodexRateLimitSnapshot,
@@ -90,6 +91,12 @@ const RECENT_THREAD_MESSAGE_LOAD_REUSE_MS = 2000
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 const GLOBAL_SERVER_REQUEST_SCOPE = '__global__'
 const MODEL_FALLBACK_ID = 'gpt-5.4-mini'
+const CODEX_CLI_MISSING_MESSAGE = 'Codex CLI not found. Install @openai/codex or set CODEXUI_CODEX_COMMAND.'
+
+function isCodexCliMissingError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+  return message.includes('Codex CLI is not available')
+}
 
 function loadReadStateMap(): Record<string, string> {
   if (typeof window === 'undefined') return {}
@@ -1387,12 +1394,15 @@ export function useDesktopState() {
   const selectedReasoningEffort = ref<ReasoningEffort | ''>('medium')
   const selectedSpeedMode = ref<SpeedMode>('standard')
   const activeProviderId = ref('')
+  const codexCliMissingError = ref('')
   const readStateByThreadId = ref<Record<string, string>>(loadReadStateMap())
   const unreadCutoffIso = ref(loadUnreadCutoffIso())
   const projectOrder = ref<string[]>(loadProjectOrder())
   const projectDisplayNameById = ref<Record<string, string>>(loadProjectDisplayNames())
   const loadedVersionByThreadId = ref<Record<string, string>>({})
   const loadedMessagesByThreadId = ref<Record<string, boolean>>({})
+  const hasMoreOlderMessagesByThreadId = ref<Record<string, boolean>>({})
+  const loadingOlderMessagesByThreadId = ref<Record<string, boolean>>({})
   const resumedThreadById = ref<Record<string, boolean>>({})
   const turnIndexByTurnIdByThreadId = ref<Record<string, Record<string, number>>>({})
   const turnSummaryByThreadId = ref<Record<string, TurnSummaryState>>({})
@@ -1542,6 +1552,23 @@ export function useDesktopState() {
     if (!summary) return combined
     return insertTurnSummaryMessage(combined, summary)
   })
+  const hasMoreOlderMessages = computed(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? hasMoreOlderMessagesByThreadId.value[threadId] === true : false
+  })
+  const isLoadingOlderMessages = computed(() => {
+    const threadId = selectedThreadId.value
+    return threadId ? loadingOlderMessagesByThreadId.value[threadId] === true : false
+  })
+
+  function getFirstPersistedTurnId(threadId: string): string {
+    const persisted = persistedMessagesByThreadId.value[threadId] ?? []
+    for (const message of persisted) {
+      const turnId = message.turnId?.trim() ?? ''
+      if (turnId) return turnId
+    }
+    return ''
+  }
 
   function readModelIdForThread(threadId: string): string {
     const contextId = toThreadContextId(threadId)
@@ -1889,7 +1916,11 @@ export function useDesktopState() {
         selectedReasoningEffort.value = currentConfig.reasoningEffort
       }
       selectedSpeedMode.value = currentConfig.speedMode
-    } catch {
+      codexCliMissingError.value = ''
+    } catch (unknownError) {
+      if (isCodexCliMissingError(unknownError)) {
+        codexCliMissingError.value = CODEX_CLI_MISSING_MESSAGE
+      }
       // Keep chat UI usable even if model metadata is temporarily unavailable.
     }
   }
@@ -4202,6 +4233,10 @@ export function useDesktopState() {
       }
 
       const { messages: nextMessages, inProgress, activeTurnId, turnIndexByTurnId } = detail
+      hasMoreOlderMessagesByThreadId.value = {
+        ...hasMoreOlderMessagesByThreadId.value,
+        [threadId]: detail.hasMoreOlder === true,
+      }
       markThreadMessagesPersisted(threadId, nextMessages)
       replaceTurnIndexLookupForThread(threadId, turnIndexByTurnId)
       rebindLiveFileChangeTurnIndices(threadId)
@@ -4257,6 +4292,50 @@ export function useDesktopState() {
 
     loadMessagePromiseByThreadId.set(threadId, loadPromise)
     await loadPromise
+  }
+
+  async function loadOlderMessages(threadId: string = selectedThreadId.value): Promise<void> {
+    if (!threadId) return
+    if (loadingOlderMessagesByThreadId.value[threadId] === true) return
+    if (hasMoreOlderMessagesByThreadId.value[threadId] !== true) return
+
+    const beforeTurnId = getFirstPersistedTurnId(threadId)
+    if (!beforeTurnId) {
+      hasMoreOlderMessagesByThreadId.value = {
+        ...hasMoreOlderMessagesByThreadId.value,
+        [threadId]: false,
+      }
+      return
+    }
+
+    loadingOlderMessagesByThreadId.value = {
+      ...loadingOlderMessagesByThreadId.value,
+      [threadId]: true,
+    }
+
+    try {
+      const page = await getOlderThreadMessages(threadId, beforeTurnId)
+      const previousPersisted = persistedMessagesByThreadId.value[threadId] ?? []
+      const mergedMessages = mergeMessages(page.messages, previousPersisted, { preserveMissing: true })
+      setPersistedMessagesForThread(threadId, mergedMessages)
+      replaceTurnIndexLookupForThread(threadId, {
+        ...(turnIndexByTurnIdByThreadId.value[threadId] ?? {}),
+        ...page.turnIndexByTurnId,
+      })
+      rebindLiveFileChangeTurnIndices(threadId)
+      hasMoreOlderMessagesByThreadId.value = {
+        ...hasMoreOlderMessagesByThreadId.value,
+        [threadId]: page.hasMoreOlder,
+      }
+    } catch (loadError) {
+      error.value = loadError instanceof Error ? loadError.message : 'Failed to load earlier messages'
+      throw loadError
+    } finally {
+      loadingOlderMessagesByThreadId.value = {
+        ...loadingOlderMessagesByThreadId.value,
+        [threadId]: false,
+      }
+    }
   }
 
   async function ensureThreadMessagesLoaded(threadId: string, options: { silent?: boolean } = {}): Promise<void> {
@@ -4340,6 +4419,9 @@ export function useDesktopState() {
       }
     } catch (unknownError) {
       error.value = unknownError instanceof Error ? unknownError.message : 'Unknown application error'
+      if (isCodexCliMissingError(unknownError)) {
+        codexCliMissingError.value = CODEX_CLI_MISSING_MESSAGE
+      }
     }
   }
 
@@ -5363,12 +5445,15 @@ export function useDesktopState() {
     selectedModelId,
     selectedReasoningEffort,
     selectedSpeedMode,
+    codexCliMissingError,
     installedSkills,
     accountRateLimitSnapshots,
     messages,
+    hasMoreOlderMessages,
     isLoadingThreads,
     isThreadListFullyLoaded,
     isLoadingMessages,
+    isLoadingOlderMessages,
     isSendingMessage,
     isInterruptingTurn,
     isUpdatingSpeedMode,
@@ -5379,6 +5464,7 @@ export function useDesktopState() {
     refreshSkills,
     selectThread,
     loadMessages,
+    loadOlderMessages,
     ensureThreadMessagesLoaded,
     setThreadTerminalOpen,
     toggleSelectedThreadTerminal,

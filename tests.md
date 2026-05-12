@@ -90,6 +90,39 @@ This file tracks manual regression and feature verification steps.
 #### Rollback/Cleanup
 - Remove any test automations from the thread automation dialog or delete their folders under `$CODEX_HOME/automations/<automation-id>/`.
 
+### Feature: Project automations and `/automations` panel
+
+#### Prerequisites
+- App is running from this repository.
+- At least two sidebar projects have absolute workspace paths.
+- Local Codex home is writable (`$CODEX_HOME` or `~/.codex`).
+- Light and dark themes are both available from Settings.
+
+#### Steps
+1. In light theme, open a project overflow menu for a project without an attached automation.
+2. Confirm the menu shows `Add automation…`, then create a project automation with a name, prompt, RRULE schedule, and status.
+3. Confirm the project row shows an automation chip and the same menu changes to `Manage automations…`.
+4. Open `/automations` from the sidebar and confirm the new project automation appears with the visible project display name.
+5. Edit the automation from `/automations`, change its name and status, save, and confirm the project row chip count and tooltip update without a full page refresh.
+6. Seed or keep a cron automation record whose `cwds` contains two project paths, then edit it from one project and confirm both project rows show the updated name/status.
+7. Seed a cron automation record with a TOML-style single-quoted `cwds` array such as `cwds = ['/tmp/project-one', '/tmp/project,two']`, refresh `/automations`, and confirm it is still listed.
+8. Inspect `/codex-api/project-automations` for the seeded record and confirm the response includes public automation fields but not `extraTomlLines`.
+9. Remove one project that has an attached automation while `/automations` is open and confirm the panel removes the deleted project row after the cleanup completes.
+10. Switch to dark theme and repeat opening the project menu and `/automations`; confirm rows, chips, buttons, inputs, and empty states remain readable.
+
+#### Expected Results
+- Project-scoped cron automations are listed under every associated `cwd`.
+- Editing a multi-`cwd` project automation refreshes all affected sidebar chips/tooltips, not only the currently edited project.
+- Existing TOML cron records with valid non-JSON string arrays remain visible and manageable.
+- Automation API responses do not include internal preserved TOML metadata such as `extraTomlLines`.
+- Removing a project deletes or detaches that project's automation association and refreshes the `/automations` panel.
+- Preserved TOML metadata and table sections remain intact after saving or deleting a project automation.
+- Light and dark theme project automation surfaces remain readable.
+
+#### Rollback/Cleanup
+- Remove any test project automations from the project automation dialog or delete their folders under `$CODEX_HOME/automations/<automation-id>/`.
+- Remove temporary test projects or workspace roots created for verification.
+
 ### Feature: Projectless new chat folders
 
 #### Prerequisites
@@ -116,6 +149,38 @@ This file tracks manual regression and feature verification steps.
 
 #### Rollback/Cleanup
 - Delete only the test folders created under `~/Documents/Codex/<YYYY-MM-DD>/`.
+
+## New chat project setup modal
+
+### Feature: Unified create project and GitHub clone modal
+
+Prerequisites/setup:
+- Run the app with access to `git` and network access to `github.com`.
+- Have a small public GitHub repository URL available for testing.
+
+Steps:
+1. Open the app in light theme and navigate to the new chat screen.
+2. Confirm the folder actions show `Select folder` and `Create Project`.
+3. Click `Create Project` and confirm a modal opens with `New project` and `Clone from GitHub` modes.
+4. In `New project`, keep or edit the destination folder, enter a single folder name, and submit.
+5. Confirm the created project folder is selected in the new chat folder selector and appears as a project root.
+6. Reopen the modal, switch to `Clone from GitHub`, paste a valid `https://github.com/<owner>/<repo>` URL, and submit.
+7. Confirm the cloned repository folder is selected in the new chat folder selector and appears as a project root.
+8. Switch the app to dark theme and repeat opening the modal.
+9. Confirm the modal, tabs, inputs, error message, and buttons have readable contrast and stable spacing.
+
+Expected results:
+- New project creation and GitHub cloning share one modal and destination folder field.
+- Created and cloned folders are registered as project roots and selected for the new chat.
+- After cloning, the folder selector immediately includes the cloned project without a full page refresh.
+- Invalid project names or non-GitHub URLs show an inline modal error without changing the selected folder.
+- A stalled clone eventually fails with an error instead of keeping the request open indefinitely.
+- Light and dark themes render the unified modal consistently with the existing new-chat controls.
+
+Rollback/cleanup:
+- Remove the created project folder from the filesystem if it was only used for testing.
+- Remove the cloned repository folder from the filesystem if it was only used for testing.
+- Remove the test projects from the app project list if they are no longer needed.
 
 ### Feature: Empty project new thread action
 
@@ -268,6 +333,126 @@ This file tracks manual regression and feature verification steps.
 
 #### Rollback/Cleanup
 - None.
+
+---
+
+### Composer expands long drafts to full screen
+
+#### Feature/Change Name
+Thread composer full-screen expand control for multi-line drafts.
+
+#### Prerequisites/Setup
+1. Dev server running (`pnpm run dev --host 127.0.0.1 --port 4173`)
+2. Any existing thread is open and send controls are enabled
+3. Light theme and dark theme both available from the appearance switcher
+
+#### Steps
+1. In light theme, type or paste at least six lines into the composer.
+2. Confirm the expand button appears in the composer input area.
+3. Click the expand button.
+4. Confirm the composer fills the viewport, keeps the draft text, and leaves model/skill/thinking/send controls usable at the bottom.
+5. Click the collapse button.
+6. Confirm the composer returns to its normal inline size with the draft still intact.
+7. Switch to dark theme and repeat steps 1-6.
+
+#### Expected Results
+- Short drafts do not show the expand control.
+- Long or overflowing drafts show an icon-only expand control.
+- Full-screen mode uses the same draft state and submit controls as inline mode.
+- Full-screen and inline states are readable in light theme and dark theme.
+
+#### Rollback/Cleanup
+- Clear the draft from the composer.
+
+---
+
+### Error-triggered feedback button
+
+#### Feature/Change Name
+Feedback action appears in Settings and on visible error banners after captured UI/runtime/API failures, then opens prefilled email diagnostics.
+
+#### Prerequisites/Setup
+1. Dev server running (`pnpm run dev --host 127.0.0.1 --port 4173` or an alternate free port).
+2. Browser devtools available to inject a test error or failed fetch.
+3. Light theme and dark theme both available from the appearance switcher.
+
+#### Steps
+1. In light theme, load the home screen, open Settings, and confirm no `Send feedback` row is visible during a clean state.
+2. Trigger a failure, for example run `fetch('/codex-api/rpc', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })` in the browser console or open a folder path that produces a visible load error.
+3. Reopen Settings and confirm a `Send feedback` row with `Issue detected` appears after the failed request is recorded.
+4. Trigger or view a visible error banner, such as the missing Codex CLI composer banner, a settings provider error, a folder picker error, a Skills Hub error, or a branch dropdown error, and confirm that error state includes a compact `Send feedback` action.
+5. Confirm no feedback action appears in the content header during normal use.
+6. Click `Send feedback` and confirm the mail client opens a draft to `brutalstrikedevs@gmail.com`.
+7. Confirm the draft body includes current URL, user agent, viewport, app/worktree version info, and recent diagnostics including the failed request or visible error.
+8. Switch to dark theme and repeat steps 1-7.
+
+#### Expected Results
+- The settings feedback action is absent during normal operation.
+- Runtime errors, unhandled rejections, failed fetches/API responses, and visible load failures make the Settings feedback action visible.
+- Visible error states include a local `Send feedback` action so the user can report the error from the same context.
+- The generated `mailto:` draft is prefilled with useful diagnostics and does not submit anything automatically.
+- No feedback action is shown in the app header during normal use.
+- The Settings feedback row and visible-error feedback actions remain readable in light and dark themes.
+
+#### Rollback/Cleanup
+- Close the generated email draft without sending if this was only a test.
+
+---
+
+### Missing Codex CLI chat error
+
+#### Feature/Change Name
+Fresh installs without a runnable Codex CLI show a visible chat runtime error.
+
+#### Prerequisites/Setup
+1. Start the app in an isolated environment without `codex` in `PATH` and without `CODEXUI_CODEX_COMMAND`.
+2. Use a mobile viewport such as `390x844`.
+3. Light theme and dark theme both available from the appearance switcher when the app can reach settings.
+
+#### Steps
+1. In light theme, open the app home/new chat screen.
+2. Confirm the composer area shows `Codex CLI not found. Install @openai/codex or set CODEXUI_CODEX_COMMAND.`
+3. Confirm the model dropdown no longer fails silently as the only visible symptom.
+4. Switch to dark theme and repeat steps 1-3.
+
+#### Expected Results
+- The missing CLI condition is visible in the chat/composer area.
+- The banner remains readable and does not overlap the mobile composer controls.
+- Dark theme uses a dark error surface, not a light-theme panel.
+
+#### Rollback/Cleanup
+- Stop and remove the isolated container or test server.
+
+---
+
+### Composio logged-out connector preview
+
+#### Feature/Change Name
+Logged-out Composio tab shows a promotional connector preview with example integrations and clear login/dashboard actions.
+
+#### Prerequisites/Setup
+1. Dev server running (`pnpm run dev --host 127.0.0.1 --port 4173`)
+2. Composio CLI installed
+3. Composio CLI logged out (`~/.composio/composio logout`)
+4. Light theme and dark theme both available from the appearance switcher
+
+#### Steps
+1. In light theme, open the Directory page and switch to the Composio tab.
+2. Confirm the logged-out state shows the connector catalog preview hero instead of a plain empty message.
+3. Confirm example connector cards are visible for Gmail, Google Calendar, Reddit, YouTube, Google Drive, and X.
+4. Type `reddit` in the Composio search box and confirm the preview cards filter to matching example content.
+5. Confirm `Login to Composio` starts the CLI login flow and `Open dashboard` opens the Composio dashboard URL.
+6. Switch to dark theme and repeat steps 1-4.
+
+#### Expected Results
+- Logged-out users see a richer preview of likely Composio connector value without requiring live catalog data.
+- The preview does not claim the example cards are connected; cards are labeled `Preview`.
+- Search filters the preview cards while logged out.
+- Login and dashboard actions remain available.
+- The hero, cards, text, badges, and buttons remain readable in light and dark themes.
+
+#### Rollback/Cleanup
+- Re-login to Composio if needed with `~/.composio/composio login --no-browser -y`.
 
 ---
 
@@ -4983,6 +5168,36 @@ The sidebar Chats section lists the first 10 projectless chats, offers Show more
 - The New chat action remains available.
 - The main sidebar search remains functional.
 - Rows and header actions remain readable in light and dark themes.
+
+#### Rollback/Cleanup
+- None.
+
+---
+
+### Thread conversation loads earlier turns on demand
+
+#### Feature/Change Name
+Thread conversation incremental older-turn loading.
+
+#### Prerequisites/Setup
+1. Dev server running (`pnpm run dev --host 127.0.0.1 --port 4173`)
+2. A thread with more than 10 turns is available
+3. Light theme and dark theme both available from the appearance switcher
+
+#### Steps
+1. In light theme, open a thread that has more than 10 turns.
+2. Confirm the newest messages render first and the conversation shows the Load earlier messages control at the top.
+3. Click Load earlier messages once.
+4. Confirm an older batch is prepended above the previously first visible turn and the scroll position stays near the same content.
+5. Continue clicking Load earlier messages until the control disappears.
+6. Confirm the oldest messages in the thread are visible and no duplicate message rows are introduced.
+7. Switch to dark theme and repeat steps 1-6 on the same thread or another long thread.
+
+#### Expected Results
+- Initial thread open remains bounded to the latest turn page.
+- Load earlier messages fetches older persisted turns from the local bridge instead of only revealing already-loaded messages.
+- The control remains available while older persisted turns exist and disappears after the first turn is loaded.
+- Message ordering, turn actions, and scroll restoration remain stable in light and dark themes.
 
 #### Rollback/Cleanup
 - None.
