@@ -49,6 +49,7 @@ import type {
   UiReviewResult,
   UiReviewScope,
   UiReviewSnapshot,
+  UiReviewSummary,
   UiReviewWorkspaceView,
   UiRateLimitSnapshot,
   UiRateLimitWindow,
@@ -248,6 +249,7 @@ type DirectoryComposioConnectorPage = {
 
 type ProviderModelsResponse = {
   data?: unknown
+  exclusive?: unknown
 }
 
 const PROVIDER_MODELS_FETCH_TIMEOUT_MS = 5_000
@@ -330,6 +332,15 @@ export type GitCommitOption = {
   shortSha: string
   subject: string
   date: string
+}
+
+export type GitCommitFileChange = {
+  path: string
+  previousPath: string | null
+  status: string
+  label: string
+  addedLineCount: number | null
+  removedLineCount: number | null
 }
 
 export type GitRepositoryStatus = {
@@ -751,6 +762,8 @@ async function getThreadSummaryV2(threadId: string): Promise<UiThread> {
 }
 
 async function getThreadDetailV2(threadId: string): Promise<{
+  model: string
+  modelProvider: string
   messages: UiMessage[]
   inProgress: boolean
   activeTurnId: string
@@ -764,6 +777,8 @@ async function getThreadDetailV2(threadId: string): Promise<{
   const startTurnIndex = readThreadTurnStartIndex(payload)
   const normalized = normalizeThreadMessagesV2(payload, startTurnIndex)
   return {
+    model: normalizeThreadModelFromPayload(payload),
+    modelProvider: normalizeThreadModelProviderFromPayload(payload),
     messages: normalized,
     inProgress: readThreadInProgressFromResponse(payload),
     activeTurnId: readActiveTurnIdFromResponse(payload),
@@ -842,6 +857,8 @@ export async function getThreadSummary(threadId: string): Promise<UiThread> {
 }
 
 export async function getThreadDetail(threadId: string): Promise<{
+  model: string
+  modelProvider: string
   messages: UiMessage[]
   inProgress: boolean
   activeTurnId: string
@@ -946,7 +963,8 @@ function normalizeReviewSnapshot(payload: unknown): UiReviewSnapshot {
   const envelope = asRecord(payload)
   const data = asRecord(envelope?.data)
   const summaryRecord = asRecord(data?.summary)
-  const scope = readString(data?.scope) === 'baseBranch' ? 'baseBranch' : 'workspace'
+  const rawScope = readString(data?.scope)
+  const scope = rawScope === 'baseBranch' || rawScope === 'commit' ? rawScope : 'workspace'
   const workspaceView = readString(data?.workspaceView) === 'staged' ? 'staged' : 'unstaged'
 
   return {
@@ -961,6 +979,7 @@ function normalizeReviewSnapshot(payload: unknown): UiReviewSnapshot {
         .map((entry) => readString(entry))
         .filter((entry): entry is string => typeof entry === 'string' && entry.length > 0)
       : [],
+    commitSha: readString(data?.commitSha),
     headBranch: readString(data?.headBranch),
     mergeBaseSha: readString(data?.mergeBaseSha),
     generatedAtIso: readString(data?.generatedAtIso) ?? '',
@@ -974,6 +993,16 @@ function normalizeReviewSnapshot(payload: unknown): UiReviewSnapshot {
         .map((entry) => normalizeReviewFile(entry))
         .filter((entry): entry is UiReviewFile => entry !== null)
       : [],
+  }
+}
+
+function normalizeReviewSummary(payload: unknown): UiReviewSummary {
+  const envelope = asRecord(payload)
+  const data = asRecord(envelope?.data)
+  return {
+    fileCount: readNumber(data?.fileCount) ?? 0,
+    addedLineCount: readNumber(data?.addedLineCount) ?? 0,
+    removedLineCount: readNumber(data?.removedLineCount) ?? 0,
   }
 }
 
@@ -1470,6 +1499,7 @@ export async function removeAccount(storageId: string): Promise<AccountsListResu
 
 export type ResumedThread = {
   model: string
+  modelProvider: string
   messages: UiMessage[]
   inProgress: boolean
   activeTurnId: string
@@ -1477,18 +1507,43 @@ export type ResumedThread = {
   turnIndexByTurnId: ThreadTurnIndexById
 }
 
+const RESUME_THREAD_COALESCE_TTL_MS = 30_000
+const recentResumeThreadById = new Map<string, Promise<ResumedThread>>()
+
 export async function resumeThread(threadId: string): Promise<ResumedThread> {
-  const payload = await callRpc<ThreadResumeResponse>('thread/resume', { threadId })
-  const startTurnIndex = readThreadTurnStartIndex(payload)
-  const messages = normalizeThreadMessagesV2(payload, startTurnIndex)
-  return {
-    model: normalizeThreadModelFromPayload(payload),
-    messages,
-    inProgress: readThreadInProgressFromResponse(payload),
-    activeTurnId: readActiveTurnIdFromResponse(payload),
-    hasMoreOlder: startTurnIndex > 0,
-    turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
-  }
+  const existing = recentResumeThreadById.get(threadId)
+  if (existing) return existing
+
+  const promise = (async () => {
+    const payload = await callRpc<ThreadResumeResponse>('thread/resume', { threadId })
+    const startTurnIndex = readThreadTurnStartIndex(payload)
+    const messages = normalizeThreadMessagesV2(payload, startTurnIndex)
+    return {
+      model: normalizeThreadModelFromPayload(payload),
+      modelProvider: normalizeThreadModelProviderFromPayload(payload),
+      messages,
+      inProgress: readThreadInProgressFromResponse(payload),
+      activeTurnId: readActiveTurnIdFromResponse(payload),
+      hasMoreOlder: startTurnIndex > 0,
+      turnIndexByTurnId: buildTurnIndexByTurnId(payload, startTurnIndex),
+    }
+  })()
+
+  recentResumeThreadById.set(threadId, promise)
+  const hardEvictionTimer = globalThis.setTimeout(() => {
+    if (recentResumeThreadById.get(threadId) === promise) {
+      recentResumeThreadById.delete(threadId)
+    }
+  }, RESUME_THREAD_COALESCE_TTL_MS)
+  void promise.finally(() => {
+    globalThis.clearTimeout(hardEvictionTimer)
+    globalThis.setTimeout(() => {
+      if (recentResumeThreadById.get(threadId) === promise) {
+        recentResumeThreadById.delete(threadId)
+      }
+    }, 2000)
+  }).catch(() => undefined)
+  return promise
 }
 
 export async function archiveThread(threadId: string): Promise<void> {
@@ -1552,9 +1607,19 @@ function normalizeThreadModelFromPayload(payload: unknown): string {
   return typeof model === 'string' ? model.trim() : ''
 }
 
+function normalizeThreadModelProviderFromPayload(payload: unknown): string {
+  const record = asRecord(payload)
+  if (!record) return ''
+  const modelProvider = readString(record.modelProvider)?.trim() ?? ''
+  if (modelProvider) return modelProvider
+  const thread = asRecord(record.thread)
+  return readString(thread?.modelProvider)?.trim() ?? ''
+}
+
 export type StartedThread = {
   threadId: string
   model: string
+  modelProvider: string
 }
 
 export type ForkedThread = {
@@ -1581,6 +1646,7 @@ export async function startThread(cwd?: string, model?: string): Promise<Started
     return {
       threadId,
       model: normalizeThreadModelFromPayload(payload),
+      modelProvider: normalizeThreadModelProviderFromPayload(payload),
     }
   } catch (error) {
     throw normalizeCodexApiError(error, 'Failed to start a new thread', 'thread/start')
@@ -1637,6 +1703,7 @@ export async function forkThread(
     return {
       threadId: nextThreadId,
       model: normalizeThreadModelFromPayload(payload),
+      modelProvider: normalizeThreadModelProviderFromPayload(payload),
     }
   } catch (error) {
     throw normalizeCodexApiError(error, `Failed to fork thread ${threadId}`, 'thread/fork')
@@ -1847,6 +1914,7 @@ export async function setCodexSpeedMode(mode: SpeedMode): Promise<void> {
 
 export interface FreeModeStatus {
   enabled: boolean
+  hasCodexAuth?: boolean
   keyCount: number
   models: string[]
   currentModel: string | null
@@ -1898,7 +1966,45 @@ export async function setCustomProvider(
   return await response.json() as { ok: boolean }
 }
 
-export async function getAvailableModelIds(options: { includeProviderModels?: boolean } = {}): Promise<string[]> {
+async function fetchProviderModelIds(providerId?: string): Promise<{ ids: string[], exclusive: boolean } | null> {
+  try {
+    const normalizedProviderId = providerId?.trim() ?? ''
+    const url = normalizedProviderId
+      ? `/codex-api/provider-models?provider=${encodeURIComponent(normalizedProviderId)}`
+      : '/codex-api/provider-models'
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(PROVIDER_MODELS_FETCH_TIMEOUT_MS),
+    })
+    let providerPayload: ProviderModelsResponse | null = null
+    try {
+      providerPayload = await response.json() as ProviderModelsResponse
+    } catch {
+      providerPayload = null
+    }
+
+    if (response.ok && Array.isArray(providerPayload?.data)) {
+      return {
+        ids: providerPayload.data
+          .map((candidate) => typeof candidate === 'string' ? candidate.trim() : '')
+          .filter((candidate, index, candidates): candidate is string =>
+            candidate.length > 0 && candidates.indexOf(candidate) === index),
+        exclusive: providerPayload.exclusive === true,
+      }
+    }
+  } catch {
+    // Keep Codex usable when the provider-models endpoint is unavailable.
+  }
+  return null
+}
+
+export async function getAvailableModelIds(options: { includeProviderModels?: boolean; requireProviderModels?: boolean; providerId?: string } = {}): Promise<string[]> {
+  const shouldIncludeProviderModels = options.includeProviderModels !== false
+  const providerModels = shouldIncludeProviderModels ? await fetchProviderModelIds(options.providerId) : null
+
+  if (providerModels?.exclusive || options.requireProviderModels) {
+    return providerModels?.ids ?? []
+  }
+
   const payload = await callRpc<ModelListResponse>('model/list', {})
   const ids: string[] = []
   for (const row of payload.data) {
@@ -1907,36 +2013,11 @@ export async function getAvailableModelIds(options: { includeProviderModels?: bo
     ids.push(candidate)
   }
 
-  if (options.includeProviderModels === false) {
-    return ids
+  if (!shouldIncludeProviderModels || !providerModels) return ids
+
+  for (const candidate of providerModels.ids) {
+    if (!ids.includes(candidate)) ids.push(candidate)
   }
-
-  try {
-    const response = await fetch('/codex-api/provider-models', {
-      signal: AbortSignal.timeout(PROVIDER_MODELS_FETCH_TIMEOUT_MS),
-    })
-    let providerPayload: (ProviderModelsResponse & { exclusive?: boolean }) | null = null
-    try {
-      providerPayload = await response.json() as ProviderModelsResponse & { exclusive?: boolean }
-    } catch {
-      providerPayload = null
-    }
-
-    if (response.ok && Array.isArray(providerPayload?.data)) {
-      if (providerPayload.exclusive) {
-        return providerPayload.data.filter((c): c is string => typeof c === 'string' && c.trim().length > 0)
-      }
-      for (const candidate of providerPayload.data) {
-        if (typeof candidate !== 'string') continue
-        const normalized = candidate.trim()
-        if (!normalized || ids.includes(normalized)) continue
-        ids.push(normalized)
-      }
-    }
-  } catch {
-    // Keep Codex usable when the provider-models endpoint is unavailable.
-  }
-
   return ids
 }
 
@@ -2685,11 +2766,15 @@ export async function checkoutGitBranch(cwd: string, branch: string): Promise<st
   return typeof branchName === 'string' && branchName.trim() ? branchName.trim() : null
 }
 
-export async function getGitBranchCommits(cwd: string, branch: string): Promise<GitCommitOption[]> {
+export async function getGitBranchCommits(cwd: string, branch: string, options: { includeResetHistory?: boolean } = {}): Promise<GitCommitOption[]> {
   const normalizedCwd = cwd.trim()
   const normalizedBranch = branch.trim()
   if (!normalizedCwd || !normalizedBranch) return []
-  const query = new URLSearchParams({ cwd: normalizedCwd, branch: normalizedBranch })
+  const query = new URLSearchParams({
+    cwd: normalizedCwd,
+    branch: normalizedBranch,
+    includeResetHistory: options.includeResetHistory === false ? 'false' : 'true',
+  })
   const response = await fetch(`/codex-api/git/branch-commits?${query.toString()}`)
   const payload = (await response.json()) as { data?: unknown; error?: string }
   if (!response.ok) {
@@ -2705,6 +2790,34 @@ export async function getGitBranchCommits(cwd: string, branch: string): Promise<
     const date = typeof record.date === 'string' ? record.date.trim() : ''
     if (!sha || !shortSha) return []
     return [{ sha, shortSha, subject: subject || shortSha, date }]
+  })
+}
+
+export async function getGitCommitFiles(cwd: string, sha: string): Promise<GitCommitFileChange[]> {
+  const normalizedCwd = cwd.trim()
+  const normalizedSha = sha.trim()
+  if (!normalizedCwd || !normalizedSha) return []
+  const query = new URLSearchParams({
+    cwd: normalizedCwd,
+    sha: normalizedSha,
+  })
+  const response = await fetch(`/codex-api/git/commit-files?${query.toString()}`)
+  const payload = (await response.json()) as { data?: unknown; error?: string }
+  if (!response.ok) {
+    throw new Error(payload.error || 'Failed to load commit files')
+  }
+  const rawList = Array.isArray(payload.data) ? payload.data : []
+  return rawList.flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const record = item as Record<string, unknown>
+    const path = typeof record.path === 'string' ? record.path : ''
+    const previousPath = typeof record.previousPath === 'string' && record.previousPath.length > 0 ? record.previousPath : null
+    const status = typeof record.status === 'string' ? record.status.trim() : ''
+    const label = typeof record.label === 'string' ? record.label.trim() : ''
+    const addedLineCount = typeof record.addedLineCount === 'number' && Number.isFinite(record.addedLineCount) ? record.addedLineCount : null
+    const removedLineCount = typeof record.removedLineCount === 'number' && Number.isFinite(record.removedLineCount) ? record.removedLineCount : null
+    if (!path || !status) return []
+    return [{ path, previousPath, status, label: label || status, addedLineCount, removedLineCount }]
   })
 }
 
@@ -2742,10 +2855,14 @@ export async function getReviewSnapshot(
   scope: UiReviewScope,
   workspaceView: UiReviewWorkspaceView,
   baseBranch?: string | null,
+  commitSha?: string | null,
 ): Promise<UiReviewSnapshot> {
   const query = new URLSearchParams({ cwd, scope, workspaceView })
   if (baseBranch && baseBranch.trim()) {
     query.set('baseBranch', baseBranch.trim())
+  }
+  if (commitSha && commitSha.trim()) {
+    query.set('commitSha', commitSha.trim())
   }
   const response = await fetch(`/codex-api/review/snapshot?${query.toString()}`)
   const payload = (await response.json()) as unknown
@@ -2753,6 +2870,19 @@ export async function getReviewSnapshot(
     throw new Error(getErrorMessageFromPayload(payload, 'Failed to load review snapshot'))
   }
   return normalizeReviewSnapshot(payload)
+}
+
+export async function getReviewSummary(
+  cwd: string,
+  workspaceView: UiReviewWorkspaceView,
+): Promise<UiReviewSummary> {
+  const query = new URLSearchParams({ cwd, workspaceView })
+  const response = await fetch(`/codex-api/review/summary?${query.toString()}`)
+  const payload = (await response.json()) as unknown
+  if (!response.ok) {
+    throw new Error(getErrorMessageFromPayload(payload, 'Failed to load review summary'))
+  }
+  return normalizeReviewSummary(payload)
 }
 
 export async function applyReviewAction(payload: {

@@ -173,6 +173,8 @@
       </SidebarMenuRow>
 
       <template v-if="isProjectsSectionExpanded">
+      <p v-if="projectAutomationActionError" class="thread-tree-action-error">{{ projectAutomationActionError }}</p>
+
       <p v-if="isSearchActive && filteredGroups.length === 0" class="thread-tree-no-results">{{ t('No matching threads') }}</p>
 
       <p v-else-if="isLoading && groups.length === 0" class="thread-tree-loading">{{ t('Loading threads...') }}</p>
@@ -891,6 +893,7 @@ import IconTablerGitFork from '../icons/IconTablerGitFork.vue'
 import IconTablerBolt from '../icons/IconTablerBolt.vue'
 import IconTablerTrash from '../icons/IconTablerTrash.vue'
 import { useUiLanguage } from '../../composables/useUiLanguage'
+import { useFeedbackDiagnostics } from '../../composables/useFeedbackDiagnostics'
 import { getPathLeafName, getPathParent, isAbsoluteLikePath, isProjectlessChatPath } from '../../pathUtils.js'
 import SidebarMenuRow from './SidebarMenuRow.vue'
 import { reconcilePinnedThreadIds } from './pinnedThreadUtils'
@@ -908,6 +911,7 @@ const props = defineProps<{
 }>()
 
 const { t } = useUiLanguage()
+const { recordVisibleFailure } = useFeedbackDiagnostics()
 
 const emit = defineEmits<{
   select: [threadId: string]
@@ -1015,6 +1019,7 @@ const automationTargetSearch = ref('')
 const automationTargetValue = ref('')
 const automationDialogError = ref('')
 const automationDialogNotice = ref('')
+const projectAutomationActionError = ref('')
 const isSavingAutomation = ref(false)
 const isRunningAutomation = ref(false)
 const automationDraft = ref<{
@@ -2267,9 +2272,22 @@ function onRemoveProject(projectName: string): void {
   const projectCwd = getProjectAutomationKey(projectName)
   emit('remove-project', projectName)
   if (projectCwd && projectHasAutomation(projectName)) {
+    projectAutomationActionError.value = ''
+    const previousAutomationByProjectName = automationByProjectName.value
     automationByProjectName.value = omitAutomationProject(automationByProjectName.value, projectCwd)
     void deleteProjectAutomation(projectCwd)
       .then(reloadProjectAutomations)
+      .catch(async (error) => {
+        automationByProjectName.value = previousAutomationByProjectName
+        const message = error instanceof Error ? error.message : 'Failed to delete project automation'
+        projectAutomationActionError.value = message
+        recordVisibleFailure(message)
+        try {
+          await reloadProjectAutomations()
+        } catch {
+          automationByProjectName.value = previousAutomationByProjectName
+        }
+      })
       .finally(() => {
         emit('automations-changed')
       })
@@ -3032,6 +3050,10 @@ onBeforeUnmount(() => {
   @apply px-3 py-2 text-sm text-zinc-400;
 }
 
+.thread-tree-action-error {
+  @apply mx-2 my-1 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700;
+}
+
 .thread-tree-groups {
   @apply pr-0.5 relative;
 }
@@ -3349,7 +3371,21 @@ onBeforeUnmount(() => {
 }
 
 .automation-thread-panel {
-  @apply max-w-lg;
+  @apply max-w-lg overflow-y-auto;
+  max-height: min(90vh, calc(100dvh - 2rem));
+  overscroll-behavior: contain;
+}
+
+.automation-thread-panel .rename-thread-subtitle {
+  @apply flex-none overflow-visible;
+}
+
+.automation-thread-panel .rename-thread-actions {
+  @apply sticky bottom-0 -mx-4 -mb-4 border-t border-zinc-200 bg-white px-4 py-3;
+}
+
+:global(:root.dark) .automation-thread-panel .rename-thread-actions {
+  @apply border-zinc-700 bg-zinc-800;
 }
 
 .automation-thread-field {
@@ -3445,5 +3481,25 @@ onBeforeUnmount(() => {
 
 .automation-thread-notice {
   @apply mb-0 text-emerald-600;
+}
+
+@media (max-height: 640px) {
+  .automation-thread-panel {
+    @apply p-3;
+  }
+
+  .automation-thread-panel .rename-thread-actions {
+    @apply -mx-3 -mb-3 px-3 py-2;
+  }
+
+  .automation-thread-field,
+  .automation-target-picker,
+  .automation-thread-list {
+    @apply mb-2;
+  }
+
+  .automation-thread-textarea {
+    min-height: 7rem;
+  }
 }
 </style>
