@@ -1,7 +1,7 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { mkdtemp, readFile, readdir, rename, rm, mkdir, stat, cp, lstat, readlink, symlink } from 'node:fs/promises'
-import { createReadStream, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { createReadStream, existsSync, readFileSync } from 'node:fs'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
@@ -12,22 +12,28 @@ import { createInterface } from 'node:readline'
 import { writeFile } from 'node:fs/promises'
 import { handleAccountRoutes } from './accountRoutes.js'
 import { buildAppServerArgs } from './appServerRuntimeConfig.js'
+import { callRpcWithRateLimitDecodeRecovery } from './rateLimitDecodeRecovery.js'
 import { handleReviewRoutes } from './reviewGit.js'
 import { handleSkillsRoutes, initializeSkillsSyncOnStartup } from './skillsRoutes.js'
 import { TelegramThreadBridge } from './telegramThreadBridge.js'
 import {
   getRandomFreeKey,
   getFreeKeyCount,
-  FREE_MODE_PROVIDER_ID,
   FREE_MODE_DEFAULT_MODEL,
   getCachedFreeModels,
   getFreeModels,
   refreshFreeModelsInBackground,
   FREE_MODE_STATE_FILE,
+  OPENCODE_ZEN_DEFAULT_MODEL,
+  OPENCODE_ZEN_PROVIDER_ID,
   createDefaultOpenCodeZenFreeModeState,
+  filterOpenCodeZenModelsForAuthState,
   getFreeModeConfigArgs,
   getFreeModeEnvVars,
+  getProviderCompatibilityConfigArgs,
+  shouldMarkOpenRouterKeyAsCustom,
   shouldCreateDefaultFreeModeStateForMissingAuth,
+  shouldSuppressCommunityFreeModeForCodexAuth,
   type FreeModeState,
 } from './freeMode.js'
 import { handleOpenRouterProxyRequest } from './openRouterProxy.js'
@@ -223,8 +229,10 @@ const PROVIDER_MODELS_FETCH_TIMEOUT_MS = 5_000
 const THREAD_RESPONSE_TURN_LIMIT = 10
 const THREAD_TURN_PAGE_READ_CACHE_TTL_MS = 30_000
 const THREAD_METHODS_WITH_TURNS = new Set(['thread/read', 'thread/resume', 'thread/fork', 'thread/rollback'])
+const THREAD_METHODS_WITH_THREAD_SNAPSHOT = new Set([...THREAD_METHODS_WITH_TURNS, 'thread/start'])
 const THREAD_SEARCH_FULL_TEXT_THREAD_LIMIT = 100
 const PROJECTLESS_THREAD_DIRECTORY_MAX_ATTEMPTS = 100
+const PROJECTLESS_THREAD_READABLE_DIRECTORY_ATTEMPTS = 20
 const PROJECTLESS_THREAD_SLUG_MAX_LENGTH = 80
 const API_PERF_LOGGING_ENV_KEY = 'CODEXUI_API_PERF_LOGGING'
 const API_PERF_MS_THRESHOLD_ENV_KEY = 'CODEXUI_API_PERF_MS_THRESHOLD'
@@ -908,6 +916,8 @@ function getErrorMessage(payload: unknown, fallback: string): string {
   const record = asRecord(payload)
   if (!record) return fallback
 
+  if (typeof record.message === 'string' && record.message.length > 0) return record.message
+
   const error = record.error
   if (typeof error === 'string' && error.length > 0) return error
 
@@ -917,6 +927,134 @@ function getErrorMessage(payload: unknown, fallback: string): string {
   }
 
   return fallback
+}
+
+export function isUnauthenticatedRateLimitError(error: unknown): boolean {
+  const message = getErrorMessage(error, '').toLowerCase()
+  return message.includes('authentication required') && message.includes('rate limits')
+}
+
+export function isEmptyThreadReadError(error: unknown): boolean {
+  const message = getErrorMessage(error, '').toLowerCase()
+  return message.includes('failed to read thread') && message.includes('rollout') && message.includes('is empty')
+}
+
+export function isThreadMaterializationPendingError(error: unknown): boolean {
+  const message = getErrorMessage(error, '').toLowerCase()
+  return message.includes('not materialized yet') && message.includes('includeturns is unavailable before first user message')
+}
+
+export function isThreadNotFoundError(error: unknown): boolean {
+  const message = getErrorMessage(error, '').toLowerCase()
+  return message.includes('thread not found') || message.includes('no rollout found for thread id')
+}
+
+function readStreamTurnId(params: Record<string, unknown>): string {
+  const directTurnId = readNonEmptyString(params.turnId) || readNonEmptyString(params.turn_id)
+  if (directTurnId) return directTurnId
+  const turn = asRecord(params.turn)
+  return readNonEmptyString(turn?.id)
+}
+
+function readStreamTurnErrorMessage(frame: StreamEventFrame): { turnId: string; message: string } | null {
+  const params = asRecord(frame.params)
+  if (!params) return null
+  const turnId = readStreamTurnId(params)
+  if (!turnId) return null
+
+  if (frame.method === 'turn/completed') {
+    const turn = asRecord(params.turn)
+    if (turn?.status !== 'failed') return null
+    const message = getErrorMessage(turn.error, '')
+    return message ? { turnId, message } : null
+  }
+
+  if (frame.method === 'error' && params.willRetry !== true) {
+    const message = getErrorMessage(params.error, '') || readNonEmptyString(params.message)
+    return message ? { turnId, message } : null
+  }
+
+  return null
+}
+
+function mergeStreamTurnErrorsIntoThreadResult(appServer: AppServerProcess, result: unknown): unknown {
+  const record = asRecord(result)
+  const thread = asRecord(record?.thread)
+  const threadId = readNonEmptyString(thread?.id)
+  const turns = Array.isArray(thread?.turns) ? thread.turns : null
+  if (!record || !thread || !threadId || !turns || turns.length === 0) return result
+
+  const errorsByTurnId = new Map<string, string>()
+  for (const frame of appServer.getStreamEvents(threadId, STREAM_EVENT_BUFFER_LIMIT)) {
+    const error = readStreamTurnErrorMessage(frame)
+    if (error) errorsByTurnId.set(error.turnId, error.message)
+  }
+  if (errorsByTurnId.size === 0) return result
+
+  let changed = false
+  const mergedTurns = turns.map((turn) => {
+    const turnRecord = asRecord(turn)
+    const turnId = readNonEmptyString(turnRecord?.id)
+    const message = turnId ? errorsByTurnId.get(turnId) : ''
+    if (!turnRecord || !turnId || !message) return turn
+    const existingErrorMessage = getErrorMessage(turnRecord.error, '')
+    if (turnRecord.status === 'failed' && existingErrorMessage) return turn
+    changed = true
+    return {
+      ...turnRecord,
+      status: 'failed',
+      error: {
+        message,
+        codexErrorInfo: null,
+        additionalDetails: null,
+      },
+    }
+  })
+
+  if (!changed) return result
+  return {
+    ...record,
+    thread: {
+      ...thread,
+      turns: mergedTurns,
+    },
+  }
+}
+
+const warnedCodexAuthReadFailures = new Set<string>()
+
+function getErrorCode(error: unknown): string | null {
+  return typeof error === 'object' && error !== null && 'code' in error
+    ? String((error as { code?: unknown }).code ?? '')
+    : null
+}
+
+function getCodexAuthReadErrorMessage(error: unknown): string {
+  return error instanceof Error && error.message.trim().length > 0
+    ? error.message
+    : String(error)
+}
+
+function warnCodexAuthReadFailure(authPath: string, error: unknown): void {
+  const message = getCodexAuthReadErrorMessage(error)
+  const warningKey = `${authPath}:${message}`
+  if (warnedCodexAuthReadFailures.has(warningKey)) return
+  warnedCodexAuthReadFailures.add(warningKey)
+  console.warn('[codex-auth] Unable to read Codex auth state', { path: authPath, error: message })
+}
+
+export async function hasUsableCodexAuth(): Promise<boolean> {
+  const authPath = getCodexAuthPath()
+  try {
+    const raw = await readFile(authPath, 'utf8')
+    const auth = JSON.parse(raw) as CodexAuth
+    return Boolean(auth.tokens?.access_token?.trim() || auth.tokens?.refresh_token?.trim())
+  } catch (error) {
+    if (getErrorCode(error) !== 'ENOENT') {
+      warnCodexAuthReadFailure(authPath, error)
+    }
+    return false
+  }
 }
 
 function setJson(res: ServerResponse, statusCode: number, payload: unknown): void {
@@ -949,6 +1087,19 @@ function buildProjectlessPromptSlug(prompt: string | null): string {
   return slug && slug.length > 0 ? slug : 'new-chat'
 }
 
+function buildProjectlessUniqueSuffix(): string {
+  return `${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`
+}
+
+export function buildProjectlessFolderName(slug: string, index: number, uniqueSuffix = buildProjectlessUniqueSuffix()): string {
+  if (index === 0) return slug
+  if (index < PROJECTLESS_THREAD_READABLE_DIRECTORY_ATTEMPTS) return `${slug}-${index + 1}`
+
+  const suffix = `-${uniqueSuffix}`
+  const maxSlugLength = Math.max(1, PROJECTLESS_THREAD_SLUG_MAX_LENGTH - suffix.length)
+  return `${slug.slice(0, maxSlugLength)}${suffix}`
+}
+
 async function ensureRealDirectory(path: string, label: string): Promise<void> {
   const info = await lstat(path)
   if (info.isSymbolicLink() || !info.isDirectory()) {
@@ -967,7 +1118,7 @@ async function createProjectlessThreadDirectory(prompt: string | null): Promise<
 
   const slug = buildProjectlessPromptSlug(prompt)
   for (let index = 0; index < PROJECTLESS_THREAD_DIRECTORY_MAX_ATTEMPTS; index += 1) {
-    const folderName = index === 0 ? slug : `${slug}-${index + 1}`
+    const folderName = buildProjectlessFolderName(slug, index)
     const cwd = join(dateDir, folderName)
     try {
       await mkdir(cwd, { recursive: false })
@@ -1109,6 +1260,25 @@ async function fetchCustomEndpointDefaultModel(baseUrl: string, apiKey: string):
   }
 }
 
+async function fetchOpenCodeZenModelIds(apiKey: string | null | undefined): Promise<string[]> {
+  const headers: Record<string, string> = {}
+  if (apiKey && apiKey !== 'dummy') {
+    headers.Authorization = `Bearer ${apiKey}`
+  }
+  const response = await fetch('https://opencode.ai/zen/v1/models', {
+    headers,
+    signal: AbortSignal.timeout(PROVIDER_MODELS_FETCH_TIMEOUT_MS),
+  })
+  if (!response.ok) return []
+  return normalizeProviderModelsData(await response.json() as unknown)
+}
+
+function sortOpenCodeZenModelIds(modelIds: string[]): string[] {
+  const freeIds = modelIds.filter((id) => id.endsWith('-free') || id === OPENCODE_ZEN_DEFAULT_MODEL)
+  const paidIds = modelIds.filter((id) => !id.endsWith('-free') && id !== OPENCODE_ZEN_DEFAULT_MODEL)
+  return [...freeIds, ...paidIds]
+}
+
 async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<ProviderModelsResponse> {
   const configPayload = asRecord(await appServer.rpc('config/read', {}))
   const config = asRecord(configPayload?.config)
@@ -1222,6 +1392,46 @@ async function readProviderBackedModelIds(appServer: AppServerProcess): Promise<
   }
 }
 
+async function readProviderModelIdsForProvider(
+  appServer: AppServerProcess,
+  providerId: string,
+): Promise<ProviderModelsResponse> {
+  const normalizedProviderId = providerId.trim().toLowerCase().replace(/_/g, '-')
+  if (!normalizedProviderId || normalizedProviderId === 'codex' || normalizedProviderId === 'openai') {
+    return { data: [], providerId: '', source: 'provider' }
+  }
+
+  const fmState = ensureDefaultFreeModeStateForMissingAuthSync(join(getCodexHomeDir(), FREE_MODE_STATE_FILE))
+  if (normalizedProviderId === 'opencode-zen') {
+    try {
+      const modelIds = filterOpenCodeZenModelsForAuthState(
+        sortOpenCodeZenModelIds(await fetchOpenCodeZenModelIds(fmState?.provider === 'opencode-zen' ? fmState.apiKey : null)),
+        fmState?.provider === 'opencode-zen' ? fmState.apiKey : null,
+      )
+      if (modelIds.length > 0) {
+        return { data: modelIds, providerId: 'opencode-zen', source: 'provider' }
+      }
+    } catch {
+      // Fall through to the offline Zen defaults.
+    }
+    return {
+      data: ['big-pickle', 'minimax-m2.5-free', 'nemotron-3-super-free', 'trinity-large-preview-free'],
+      providerId: 'opencode-zen',
+      source: 'provider',
+    }
+  }
+
+  if (normalizedProviderId === 'openrouter-free' || normalizedProviderId === 'openrouter') {
+    return {
+      data: await getFreeModels(),
+      providerId: 'openrouter-free',
+      source: 'provider',
+    }
+  }
+
+  return readProviderBackedModelIds(appServer)
+}
+
 function extractThreadMessageText(threadReadPayload: unknown): string {
   const payload = asRecord(threadReadPayload)
   const thread = asRecord(payload?.thread)
@@ -1288,14 +1498,20 @@ export async function callRpcWithArchiveRecovery(
   params: unknown,
 ): Promise<unknown> {
   try {
-    return await appServer.rpc(method, params ?? null)
+    return await callRpcWithRateLimitDecodeRecovery(appServer, method, params)
   } catch (error) {
+    const paramsRecord = asRecord(params)
+    const threadId = readNonEmptyString(paramsRecord?.threadId)
+
+    if (method === 'turn/start' && threadId && isThreadNotFoundError(error)) {
+      await appServer.rpc('thread/resume', { threadId })
+      return appServer.rpc(method, params ?? null)
+    }
+
     if (method !== 'thread/archive') {
       throw error
     }
 
-    const paramsRecord = asRecord(params)
-    const threadId = readNonEmptyString(paramsRecord?.threadId)
     const errorMessage = getErrorMessage(error, '')
     if (!threadId || !errorMessage.includes('no rollout found')) {
       throw error
@@ -2800,6 +3016,10 @@ async function ensureRepoHasInitialCommit(repoRoot: string): Promise<void> {
 }
 
 async function runCommandCapture(command: string, args: string[], options: { cwd?: string } = {}): Promise<string> {
+  return (await runCommandCaptureRaw(command, args, options)).trim()
+}
+
+async function runCommandCaptureRaw(command: string, args: string[], options: { cwd?: string } = {}): Promise<string> {
   return await new Promise<string>((resolve, reject) => {
     const proc = spawn(command, args, {
       cwd: options.cwd,
@@ -2813,7 +3033,7 @@ async function runCommandCapture(command: string, args: string[], options: { cwd
     proc.on('error', reject)
     proc.on('close', (code) => {
       if (code === 0) {
-        resolve(stdout.trim())
+        resolve(stdout)
         return
       }
       const details = [stderr.trim(), stdout.trim()].filter(Boolean).join('\n')
@@ -2836,22 +3056,107 @@ function toHeaderGitResetHistoryRef(branchName: string, commitSha: string): stri
 }
 
 const HEADER_GIT_RESET_HISTORY_REF_LIMIT = 25
+const HEADER_GIT_UNTRACKED_BACKUP_DIR = '.codex/untracked-backups'
 
 async function assertLocalGitBranch(repoRoot: string, branchName: string): Promise<void> {
   await runCommandCapture('git', ['show-ref', '--verify', `refs/heads/${branchName}`], { cwd: repoRoot })
 }
 
-async function checkoutGitBranchWithWorktreeRecovery(repoRoot: string, branchName: string): Promise<void> {
-  try {
-    await runCommand('git', ['checkout', branchName], { cwd: repoRoot })
-  } catch (checkoutError) {
-    const blockingWorktreePath = extractBranchLockedWorktreePath(checkoutError, branchName)
-    if (!blockingWorktreePath) {
-      throw checkoutError
+function splitGitPathList(raw: string): string[] {
+  return raw
+    .split('\0')
+    .filter((entry) => entry.length > 0)
+}
+
+function isSafeGitRelativePath(filePath: string): boolean {
+  return Boolean(filePath) && !isAbsolute(filePath) && !filePath.split('/').includes('..')
+}
+
+function resolveGitRelativePath(repoRoot: string, filePath: string): string {
+  return join(repoRoot, ...filePath.split('/'))
+}
+
+type PreservedUntrackedFile = {
+  filePath: string
+  sourcePath: string
+  backupPath: string
+}
+
+function gitPathsConflict(left: string, right: string): boolean {
+  return left === right || left.startsWith(`${right}/`) || right.startsWith(`${left}/`)
+}
+
+async function removeEmptyGitRelativeParents(repoRoot: string, filePath: string): Promise<void> {
+  let current = dirname(resolveGitRelativePath(repoRoot, filePath))
+  while (current !== repoRoot && current.startsWith(`${repoRoot}/`)) {
+    try {
+      await rm(current, { recursive: false })
+    } catch {
+      return
     }
-    await runCommand('git', ['checkout', '--detach'], { cwd: blockingWorktreePath })
-    await runCommand('git', ['checkout', branchName], { cwd: repoRoot })
+    current = dirname(current)
   }
+}
+
+async function rollbackPreservedUntrackedFiles(entries: PreservedUntrackedFile[]): Promise<void> {
+  for (const entry of entries.slice().reverse()) {
+    try {
+      if (existsSync(entry.backupPath) && !existsSync(entry.sourcePath)) {
+        await mkdir(dirname(entry.sourcePath), { recursive: true })
+        await rename(entry.backupPath, entry.sourcePath)
+      }
+    } catch {
+      // Preserve the original git failure; best-effort rollback avoids masking it.
+    }
+  }
+}
+
+async function preserveUntrackedFilesForGitTarget(repoRoot: string, targetRef: string): Promise<PreservedUntrackedFile[]> {
+  const [untrackedRaw, targetTreeRaw] = await Promise.all([
+    runCommandCaptureRaw('git', ['ls-files', '--others', '--exclude-standard', '-z'], { cwd: repoRoot }),
+    runCommandCaptureRaw('git', ['ls-tree', '-r', '--name-only', '-z', `${targetRef}^{tree}`], { cwd: repoRoot }),
+  ])
+  const targetPaths = splitGitPathList(targetTreeRaw)
+  const conflictingUntrackedPaths = splitGitPathList(untrackedRaw)
+    .filter((filePath) => isSafeGitRelativePath(filePath) && targetPaths.some((targetPath) => gitPathsConflict(filePath, targetPath)))
+  if (conflictingUntrackedPaths.length === 0) return []
+
+  const backupRoot = join(repoRoot, HEADER_GIT_UNTRACKED_BACKUP_DIR, new Date().toISOString().replace(/[:.]/g, '-'))
+  const movedFiles: PreservedUntrackedFile[] = []
+  for (const filePath of conflictingUntrackedPaths) {
+    const sourcePath = resolveGitRelativePath(repoRoot, filePath)
+    const backupPath = join(backupRoot, ...filePath.split('/'))
+    await mkdir(dirname(backupPath), { recursive: true })
+    await rename(sourcePath, backupPath)
+    movedFiles.push({ filePath, sourcePath, backupPath })
+    await removeEmptyGitRelativeParents(repoRoot, filePath)
+  }
+  return movedFiles
+}
+
+async function withPreservedUntrackedFilesForGitTarget(repoRoot: string, targetRef: string, operation: () => Promise<void>): Promise<void> {
+  const movedFiles = await preserveUntrackedFilesForGitTarget(repoRoot, targetRef)
+  try {
+    await operation()
+  } catch (error) {
+    await rollbackPreservedUntrackedFiles(movedFiles)
+    throw error
+  }
+}
+
+async function checkoutGitBranchWithWorktreeRecovery(repoRoot: string, branchName: string): Promise<void> {
+  await withPreservedUntrackedFilesForGitTarget(repoRoot, branchName, async () => {
+    try {
+      await runCommand('git', ['checkout', branchName], { cwd: repoRoot })
+    } catch (checkoutError) {
+      const blockingWorktreePath = extractBranchLockedWorktreePath(checkoutError, branchName)
+      if (!blockingWorktreePath) {
+        throw checkoutError
+      }
+      await runCommand('git', ['checkout', '--detach'], { cwd: blockingWorktreePath })
+      await runCommand('git', ['checkout', branchName], { cwd: repoRoot })
+    }
+  })
 }
 
 async function pruneHeaderGitResetHistoryRefs(repoRoot: string, branchName: string): Promise<void> {
@@ -3202,17 +3507,22 @@ function readFreeModeStateSync(statePath: string): FreeModeState | null {
   }
 }
 
-function ensureDefaultFreeModeStateForMissingAuthSync(statePath: string): FreeModeState | null {
+export async function writeFreeModeStateFile(statePath: string, state: FreeModeState): Promise<void> {
+  await mkdir(dirname(statePath), { recursive: true })
+  await writeFile(statePath, JSON.stringify(state), { encoding: 'utf8', mode: 0o600 })
+}
+
+export function ensureDefaultFreeModeStateForMissingAuthSync(statePath: string): FreeModeState | null {
   const current = readFreeModeStateSync(statePath)
-  if (!shouldCreateDefaultFreeModeStateForMissingAuth(current, hasUsableCodexAuthSync())) {
+  const hasUsableCodexAuth = hasUsableCodexAuthSync()
+  if (shouldSuppressCommunityFreeModeForCodexAuth(current, hasUsableCodexAuth)) {
+    return null
+  }
+  if (!shouldCreateDefaultFreeModeStateForMissingAuth(current, hasUsableCodexAuth)) {
     return current
   }
 
-  const fallback = createDefaultOpenCodeZenFreeModeState()
-
-  mkdirSync(dirname(statePath), { recursive: true })
-  writeFileSync(statePath, JSON.stringify(fallback), { encoding: 'utf8', mode: 0o600 })
-  return fallback
+  return createDefaultOpenCodeZenFreeModeState()
 }
 
 function isLoopbackRemoteAddress(remoteAddress: string | undefined): boolean {
@@ -4622,7 +4932,6 @@ class AppServerProcess {
   private readonly pending = new Map<number, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void }>()
   private readonly notificationListeners = new Set<(value: { method: string; params: unknown }) => void>()
   private readonly pendingServerRequests = new Map<number, PendingServerRequest>()
-  private readonly appServerArgs = buildAppServerArgs()
   private readonly streamEventsByThreadId = new Map<string, StreamEventFrame[]>()
   private readonly lastThreadReadSnapshotByThreadId = new Map<string, unknown>()
   private readonly threadTurnPageReadCacheByThreadId = new Map<string, { result: unknown; expiresAt: number }>()
@@ -4630,6 +4939,7 @@ class AppServerProcess {
   private readonly capturedItemsByThreadId = new Map<string, Map<string, CapturedItem>>()
   private readonly liveStateCache = new Map<string, { data: unknown; turnCount: number; sessionSize: number }>()
   private chatgptAuthRefreshPromise: Promise<ChatgptAuthTokensRefreshResponse> | null = null
+  private activeConfigSignature = ''
 
 
   private getCodexCommand(): string {
@@ -4641,13 +4951,10 @@ class AppServerProcess {
   }
 
   private buildAppServerConfig(): { args: string[]; env: Record<string, string> } {
-    const args = [
-      'app-server',
-      '-c', 'approval_policy="never"',
-      '-c', 'sandbox_mode="danger-full-access"',
-    ]
+    const args = buildAppServerArgs()
     let extraEnv: Record<string, string> = {}
     const serverPort = parseInt(process.env.CODEXUI_SERVER_PORT ?? '', 10) || undefined
+    args.push(...getProviderCompatibilityConfigArgs(serverPort))
     const statePath = join(getCodexHomeDir(), FREE_MODE_STATE_FILE)
     try {
       const state = ensureDefaultFreeModeStateForMissingAuthSync(statePath)
@@ -4661,11 +4968,29 @@ class AppServerProcess {
     return { args, env: extraEnv }
   }
 
+  private getAppServerConfigSignature(config: { args: string[]; env: Record<string, string> }): string {
+    return JSON.stringify({
+      args: config.args,
+      env: Object.keys(config.env)
+        .sort()
+        .map((key) => [key, config.env[key]]),
+    })
+  }
+
+  private disposeIfConfigChanged(): void {
+    if (!this.process) return
+    const config = this.buildAppServerConfig()
+    const nextSignature = this.getAppServerConfigSignature(config)
+    if (this.activeConfigSignature === nextSignature) return
+    this.dispose()
+  }
+
   private start(): void {
     if (this.process) return
 
     this.stopping = false
     const config = this.buildAppServerConfig()
+    this.activeConfigSignature = this.getAppServerConfigSignature(config)
     const invocation = getSpawnInvocation(this.getCodexCommand(), config.args)
     const spawnEnv = Object.keys(config.env).length > 0
       ? { ...process.env, ...config.env }
@@ -5091,6 +5416,7 @@ class AppServerProcess {
   }
 
   async rpc(method: string, params: unknown): Promise<unknown> {
+    this.disposeIfConfigChanged()
     await this.ensureInitialized()
     return this.call(method, params)
   }
@@ -5146,6 +5472,7 @@ class AppServerProcess {
     this.process = null
     this.initialized = false
     this.initializePromise = null
+    this.activeConfigSignature = ''
     this.readBuffer = ''
 
     const failure = new Error('codex app-server stopped')
@@ -5749,11 +6076,13 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         }
         const statePath = join(getCodexHomeDir(), FREE_MODE_STATE_FILE)
         let bearerToken = ''
-        let wireApi: 'responses' | 'chat' = 'chat'
+        let wireApi: 'responses' | 'chat' = 'responses'
         try {
-          const state = JSON.parse(readFileSync(statePath, 'utf8')) as FreeModeState
-          bearerToken = state.apiKey ?? ''
-          wireApi = state.wireApi === 'responses' ? 'responses' : 'chat'
+          const state = ensureDefaultFreeModeStateForMissingAuthSync(statePath)
+          bearerToken = state?.apiKey ?? ''
+          if (state) {
+            wireApi = state.wireApi === 'responses' ? 'responses' : 'chat'
+          }
         } catch { /* use empty */ }
         handleZenProxyRequest(req, res, bearerToken, wireApi)
         return
@@ -5778,10 +6107,10 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         let wireApi: 'responses' | 'chat' = 'responses'
         let baseUrl = ''
         try {
-          const state = JSON.parse(readFileSync(statePath, 'utf8')) as FreeModeState
-          bearerToken = state.apiKey ?? ''
-          wireApi = state.wireApi === 'chat' ? 'chat' : 'responses'
-          baseUrl = state.customBaseUrl ?? ''
+          const state = ensureDefaultFreeModeStateForMissingAuthSync(statePath)
+          bearerToken = state?.apiKey ?? ''
+          wireApi = state?.wireApi === 'chat' ? 'chat' : 'responses'
+          baseUrl = state?.customBaseUrl ?? ''
         } catch { /* use empty */ }
         handleCustomEndpointProxyRequest(req, res, { baseUrl, bearerToken, wireApi })
         return
@@ -5820,7 +6149,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 wireApi: prev.wireApi === 'chat' ? 'chat' : 'responses',
                 providerKeys: prevKeys,
               }
-              await writeFile(statePath, JSON.stringify(state), 'utf8')
+              await writeFreeModeStateFile(statePath, state)
               appServer.dispose()
               const freeModels = await getFreeModels()
               setJson(res, 200, {
@@ -5843,7 +6172,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 wireApi: prev.wireApi === 'chat' ? 'chat' : 'responses',
                 providerKeys: prevKeys,
               }
-              await writeFile(statePath, JSON.stringify(state), 'utf8')
+              await writeFreeModeStateFile(statePath, state)
               appServer.dispose()
               setJson(res, 200, { ok: true, enabled: false })
             }
@@ -5859,17 +6188,49 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             const maskedKey = state.apiKey && state.customKey
               ? state.apiKey.substring(0, 12) + '...' + state.apiKey.substring(state.apiKey.length - 4)
               : null
-            refreshFreeModelsInBackground()
+            let models = getCachedFreeModels()
+            let currentModel = state.enabled ? state.model : null
+            let wireApi = state.wireApi ?? null
+            if (state.provider === OPENCODE_ZEN_PROVIDER_ID) {
+              currentModel = state.enabled ? (state.model?.trim() || OPENCODE_ZEN_DEFAULT_MODEL) : null
+              try {
+                const zenModels = filterOpenCodeZenModelsForAuthState(
+                  sortOpenCodeZenModelIds(await fetchOpenCodeZenModelIds(state.apiKey)),
+                  state.apiKey,
+                )
+                if (zenModels.length > 0) {
+                  models = zenModels
+                } else {
+                  models = [
+                    OPENCODE_ZEN_DEFAULT_MODEL,
+                    'minimax-m2.5-free',
+                    'nemotron-3-super-free',
+                    'trinity-large-preview-free',
+                  ]
+                }
+              } catch {
+                models = [
+                  OPENCODE_ZEN_DEFAULT_MODEL,
+                  'minimax-m2.5-free',
+                  'nemotron-3-super-free',
+                  'trinity-large-preview-free',
+                ]
+              }
+              wireApi = 'responses'
+            } else {
+              refreshFreeModelsInBackground()
+            }
             setJson(res, 200, {
               enabled: state.enabled,
+              hasCodexAuth: hasUsableCodexAuthSync(),
               keyCount: getFreeKeyCount(),
-              models: getCachedFreeModels(),
-              currentModel: state.enabled ? state.model : null,
+              models,
+              currentModel,
               customKey: Boolean(state.customKey),
               maskedKey,
               provider: state.provider ?? 'openrouter',
               customBaseUrl: state.customBaseUrl ?? null,
-              wireApi: state.wireApi ?? null,
+              wireApi,
             })
           } catch (error) {
             setJson(res, 500, { error: getErrorMessage(error, 'Failed to read free mode status') })
@@ -5886,7 +6247,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             }
             const current = readFreeModeState()
             const state: FreeModeState = { ...current, apiKey, customKey: false }
-            await writeFile(statePath, JSON.stringify(state), 'utf8')
+            await writeFreeModeStateFile(statePath, state)
             appServer.dispose()
             setJson(res, 200, { ok: true })
           } catch (error) {
@@ -5910,7 +6271,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 provider: 'openrouter',
                 wireApi: current.wireApi === 'chat' ? 'chat' : 'responses',
               }
-              await writeFile(statePath, JSON.stringify(state), 'utf8')
+              await writeFreeModeStateFile(statePath, state)
               appServer.dispose()
               setJson(res, 200, { ok: true, customKey: true })
             } else {
@@ -5922,7 +6283,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
                 provider: 'openrouter',
                 wireApi: current.wireApi === 'chat' ? 'chat' : 'responses',
               }
-              await writeFile(statePath, JSON.stringify(state), 'utf8')
+              await writeFreeModeStateFile(statePath, state)
               appServer.dispose()
               setJson(res, 200, { ok: true, customKey: false })
             }
@@ -5956,22 +6317,25 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             if (resolvedKey) {
               prevKeys[providerType] = resolvedKey
             }
+            const currentModel = (current.model ?? '').trim()
             const resolvedModel = providerType === 'openrouter'
-              ? (current.model || FREE_MODE_DEFAULT_MODEL)
+              ? (currentModel.includes('/') ? currentModel : FREE_MODE_DEFAULT_MODEL)
               : providerType === 'custom'
                 ? await fetchCustomEndpointDefaultModel(baseUrl, resolvedKey)
-                : ''
+                : OPENCODE_ZEN_DEFAULT_MODEL
             const state: FreeModeState = {
               enabled: true,
               apiKey: resolvedKey,
               model: resolvedModel,
-              customKey: providerType === 'openrouter' ? current.customKey : true,
+              customKey: providerType === 'openrouter'
+                ? shouldMarkOpenRouterKeyAsCustom(current, apiKey)
+                : true,
               provider: providerType,
               customBaseUrl: providerType === 'custom' ? baseUrl : undefined,
               wireApi,
               providerKeys: prevKeys,
             }
-            await writeFile(statePath, JSON.stringify(state), 'utf8')
+            await writeFreeModeStateFile(statePath, state)
             appServer.dispose()
             setJson(res, 200, { ok: true })
           } catch (error) {
@@ -6115,22 +6479,69 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         }
         rpcMethod = body?.method && typeof body.method === 'string' ? body.method : null
 
-        if (!body || typeof body.method !== 'string' || body.method.length === 0) {
-          setJson(res, 400, { error: 'Invalid body: expected { method, params? }' })
-          return
-        }
+	        if (!body || typeof body.method !== 'string' || body.method.length === 0) {
+	          setJson(res, 400, { error: 'Invalid body: expected { method, params? }' })
+	          return
+	        }
 
-        const rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, body.params ?? null)
+	        if (body.method === 'generate-thread-title') {
+	          setJson(res, 200, { result: { title: '' } })
+	          return
+	        }
+
+	        if (body.method === 'account/rateLimits/read' && !(await hasUsableCodexAuth())) {
+	          setJson(res, 200, { result: null })
+	          return
+	        }
+
+        let rpcResult: unknown
+        try {
+          rpcResult = await callRpcWithArchiveRecovery(appServer, body.method, body.params ?? null)
+        } catch (error) {
+	          if (body.method === 'account/rateLimits/read' && isUnauthenticatedRateLimitError(error)) {
+	            setJson(res, 200, { result: null })
+	            return
+	          }
+		          if (body.method === 'thread/read' && isEmptyThreadReadError(error)) {
+		            const params = asRecord(body.params)
+		            const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
+		            const snapshot = threadId ? appServer.getLastThreadReadSnapshot(threadId) : null
+		            if (snapshot) {
+		              setJson(res, 200, { result: snapshot })
+		              return
+		            }
+		          }
+          if (body.method === 'thread/read' && isThreadMaterializationPendingError(error)) {
+            const params = asRecord(body.params)
+            const threadId = typeof params?.threadId === 'string' ? params.threadId.trim() : ''
+            if (threadId) {
+              setJson(res, 200, {
+                result: {
+                  thread: {
+                    id: threadId,
+                    turns: [],
+                    status: { type: 'inProgress' },
+                  },
+                },
+              })
+              return
+            }
+          }
+		          throw error
+		        }
         const trimmedResult = trimThreadTurnsInRpcResult(body.method, rpcResult)
-        const sanitizedResult = await sanitizeThreadTurnsInlinePayloads(body.method, trimmedResult)
+        const errorMergedResult = THREAD_METHODS_WITH_TURNS.has(body.method)
+          ? mergeStreamTurnErrorsIntoThreadResult(appServer, trimmedResult)
+          : trimmedResult
+        const sanitizedResult = await sanitizeThreadTurnsInlinePayloads(body.method, errorMergedResult)
         const result = THREAD_METHODS_WITH_TURNS.has(body.method)
           ? await mergeSessionSkillInputsIntoThreadResult(sanitizedResult)
           : sanitizedResult
 
-        if (THREAD_METHODS_WITH_TURNS.has(body.method)) {
-          const rpcRecord = asRecord(result)
-          const rpcThread = asRecord(rpcRecord?.thread)
-          const rpcThreadId = typeof rpcThread?.id === 'string' ? rpcThread.id : ''
+	        if (THREAD_METHODS_WITH_THREAD_SNAPSHOT.has(body.method)) {
+	          const rpcRecord = asRecord(result)
+	          const rpcThread = asRecord(rpcRecord?.thread)
+	          const rpcThreadId = typeof rpcThread?.id === 'string' ? rpcThread.id : ''
           if (rpcThreadId) {
             appServer.storeThreadReadSnapshot(rpcThreadId, result)
           }
@@ -6151,7 +6562,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
             return
           }
 
-          const threadReadResult = await appServer.readThreadForTurnPage(threadId)
+          const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, await appServer.readThreadForTurnPage(threadId))
           const record = asRecord(threadReadResult)
           const thread = asRecord(record?.thread)
           if (!record || !thread) {
@@ -6251,10 +6662,10 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         }
 
         try {
-          const threadReadResult = await appServer.rpc('thread/read', {
+          const threadReadResult = mergeStreamTurnErrorsIntoThreadResult(appServer, await appServer.rpc('thread/read', {
             threadId,
             includeTurns: true,
-          })
+          }))
           const sanitized = await sanitizeThreadTurnsInlinePayloads('thread/read', threadReadResult)
           appServer.storeThreadReadSnapshot(threadId, sanitized)
 
@@ -6307,6 +6718,17 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
           setJson(res, 200, responseData)
         } catch (error) {
+          if (isThreadMaterializationPendingError(error)) {
+            setJson(res, 200, {
+              threadId,
+              conversationState: { turns: [] },
+              ownerClientId: null,
+              liveStateError: null,
+              isInProgress: true,
+            })
+            return
+          }
+
           const snapshot = appServer.getLastThreadReadSnapshot(threadId)
           if (snapshot) {
             const record = asRecord(snapshot)
@@ -6522,22 +6944,24 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
 
       if (req.method === 'GET' && url.pathname === '/codex-api/provider-models') {
         try {
+          const requestedProvider = url.searchParams.get('provider')?.trim() ?? ''
+          if (requestedProvider) {
+            setJson(res, 200, {
+              ...(await readProviderModelIdsForProvider(appServer, requestedProvider)),
+              exclusive: true,
+            })
+            return
+          }
           const fmState = ensureDefaultFreeModeStateForMissingAuthSync(join(getCodexHomeDir(), FREE_MODE_STATE_FILE))
           if (fmState?.enabled) {
             if (fmState.provider === 'opencode-zen') {
               try {
-                const modelsUrl = 'https://opencode.ai/zen/v1/models'
-                const headers: Record<string, string> = {}
-                if (fmState.apiKey && fmState.apiKey !== 'dummy') {
-                  headers['Authorization'] = `Bearer ${fmState.apiKey}`
-                }
-                const resp = await fetch(modelsUrl, { headers, signal: AbortSignal.timeout(8000) })
-                if (resp.ok) {
-                  const json = await resp.json() as { data?: Array<{ id: string }> }
-                  const allIds = (json.data ?? []).map(m => m.id).filter(Boolean)
-                  const freeIds = allIds.filter(id => id.endsWith('-free') || id === 'big-pickle')
-                  const paidIds = allIds.filter(id => !id.endsWith('-free') && id !== 'big-pickle')
-                  setJson(res, 200, { data: [...freeIds, ...paidIds], exclusive: true, source: 'opencode-zen' })
+                const modelIds = filterOpenCodeZenModelsForAuthState(
+                  sortOpenCodeZenModelIds(await fetchOpenCodeZenModelIds(fmState.apiKey)),
+                  fmState.apiKey,
+                )
+                if (modelIds.length > 0) {
+                  setJson(res, 200, { data: modelIds, exclusive: true, source: 'opencode-zen' })
                   return
                 }
               } catch {
@@ -6972,6 +7396,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         try {
           const gitRoot = await runCommandCapture('git', ['rev-parse', '--show-toplevel'], { cwd })
           await assertNoTrackedGitChanges(gitRoot)
+          await assertLocalGitBranch(gitRoot, targetBranch)
           await checkoutGitBranchWithWorktreeRecovery(gitRoot, targetBranch)
           setJson(res, 200, { data: await readGitHeaderState(gitRoot) })
         } catch (error) {
@@ -6983,6 +7408,7 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
       if (req.method === 'GET' && url.pathname === '/codex-api/git/branch-commits') {
         const rawCwd = (url.searchParams.get('cwd') ?? '').trim()
         const branch = (url.searchParams.get('branch') ?? '').trim()
+        const includeResetHistory = url.searchParams.get('includeResetHistory') !== 'false'
         if (!rawCwd) {
           setJson(res, 400, { error: 'Missing cwd' })
           return
@@ -6995,20 +7421,23 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
         try {
           const gitRoot = await runCommandCapture('git', ['rev-parse', '--show-toplevel'], { cwd })
           await runCommandCapture('git', ['rev-parse', '--verify', `${branch}^{commit}`], { cwd: gitRoot })
-          const resetHistoryRefPrefix = `refs/codex/header-git-reset-history/${branch}/`
-          const resetHistoryRefsRaw = await runCommandCapture(
-            'git',
-            ['for-each-ref', '--sort=-creatordate', '--format=%(refname)', resetHistoryRefPrefix],
-            { cwd: gitRoot },
-          ).catch(() => '')
-          const resetHistoryRefs = resetHistoryRefsRaw
-            .split('\n')
-            .map((entry) => entry.trim())
-            .filter(Boolean)
-            .slice(0, HEADER_GIT_RESET_HISTORY_REF_LIMIT)
+          let resetHistoryRefs: string[] = []
+          if (includeResetHistory) {
+            const resetHistoryRefPrefix = `refs/codex/header-git-reset-history/${branch}/`
+            const resetHistoryRefsRaw = await runCommandCapture(
+              'git',
+              ['for-each-ref', '--sort=-creatordate', '--format=%(refname)', resetHistoryRefPrefix],
+              { cwd: gitRoot },
+            ).catch(() => '')
+            resetHistoryRefs = resetHistoryRefsRaw
+              .split('\n')
+              .map((entry) => entry.trim())
+              .filter(Boolean)
+              .slice(0, HEADER_GIT_RESET_HISTORY_REF_LIMIT)
+          }
           const output = await runCommandCapture(
             'git',
-            ['log', '-n', '12', '--date=short', '--format=%H%x09%h%x09%cd%x09%s', branch, ...resetHistoryRefs],
+            ['log', '-n', '50', '--date=short', '--format=%H%x09%h%x09%cd%x09%s', branch, ...resetHistoryRefs],
             { cwd: gitRoot },
           )
           const commits = output.split('\n').flatMap((line) => {
@@ -7021,6 +7450,94 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           setJson(res, 200, { data: commits })
         } catch (error) {
           setJson(res, 500, { error: getErrorMessage(error, 'Failed to load branch commits') })
+        }
+        return
+      }
+
+      if (req.method === 'GET' && url.pathname === '/codex-api/git/commit-files') {
+        const rawCwd = (url.searchParams.get('cwd') ?? '').trim()
+        const sha = (url.searchParams.get('sha') ?? '').trim()
+        if (!rawCwd) {
+          setJson(res, 400, { error: 'Missing cwd' })
+          return
+        }
+        if (!sha) {
+          setJson(res, 400, { error: 'Missing sha' })
+          return
+        }
+        const cwd = isAbsolute(rawCwd) ? rawCwd : resolve(rawCwd)
+        try {
+          const gitRoot = await runCommandCapture('git', ['rev-parse', '--show-toplevel'], { cwd })
+          await runCommandCapture('git', ['rev-parse', '--verify', `${sha}^{commit}`], { cwd: gitRoot })
+          const output = await runCommandCaptureRaw(
+            'git',
+            ['diff-tree', '--root', '--no-commit-id', '--name-status', '-r', '-M', '-z', sha],
+            { cwd: gitRoot },
+          )
+          const numstatOutput = await runCommandCaptureRaw(
+            'git',
+            ['diff-tree', '--root', '--no-commit-id', '--numstat', '-r', '-M', '-z', sha],
+            { cwd: gitRoot },
+          )
+          const splitNumstatRecord = (record: string): { addedRaw: string; removedRaw: string; path: string } | null => {
+            const firstTab = record.indexOf('\t')
+            if (firstTab < 0) return null
+            const secondTab = record.indexOf('\t', firstTab + 1)
+            if (secondTab < 0) return null
+            return {
+              addedRaw: record.slice(0, firstTab),
+              removedRaw: record.slice(firstTab + 1, secondTab),
+              path: record.slice(secondTab + 1),
+            }
+          }
+          const lineCountsByPath = new Map<string, { addedLineCount: number | null; removedLineCount: number | null }>()
+          const numstatRecords = splitGitPathList(numstatOutput)
+          for (let index = 0; index < numstatRecords.length; index += 1) {
+            const record = splitNumstatRecord(numstatRecords[index] ?? '')
+            if (!record) continue
+            const { addedRaw, removedRaw } = record
+            const path = record.path || numstatRecords[index + 2] || numstatRecords[index + 1] || ''
+            if (!record.path) index += 2
+            if (!path) continue
+            const addedLineCount = /^\d+$/.test(addedRaw) ? Number(addedRaw) : null
+            const removedLineCount = /^\d+$/.test(removedRaw) ? Number(removedRaw) : null
+            lineCountsByPath.set(path, { addedLineCount, removedLineCount })
+          }
+          const nameStatusRecords = splitGitPathList(output)
+          const files: Array<{
+            path: string
+            previousPath: string | null
+            status: string
+            label: string
+            addedLineCount: number | null
+            removedLineCount: number | null
+          }> = []
+          for (let index = 0; index < nameStatusRecords.length; index += 1) {
+            const status = nameStatusRecords[index] ?? ''
+            if (!status) continue
+            const statusKind = status.charAt(0)
+            const isRenameOrCopy = statusKind === 'R' || statusKind === 'C'
+            const previousPath = isRenameOrCopy ? nameStatusRecords[index + 1] || null : null
+            const path = isRenameOrCopy ? nameStatusRecords[index + 2] || '' : nameStatusRecords[index + 1] || ''
+            index += isRenameOrCopy ? 2 : 1
+            if (!path) continue
+            const label = statusKind === 'A'
+              ? 'Added'
+              : statusKind === 'D'
+                ? 'Deleted'
+                : statusKind === 'R'
+                  ? 'Renamed'
+                  : statusKind === 'C'
+                    ? 'Copied'
+                    : statusKind === 'M'
+                      ? 'Modified'
+                      : status
+            const lineCounts = lineCountsByPath.get(path) ?? { addedLineCount: null, removedLineCount: null }
+            files.push({ path, previousPath, status, label, ...lineCounts })
+          }
+          setJson(res, 200, { data: files })
+        } catch (error) {
+          setJson(res, 500, { error: getErrorMessage(error, 'Failed to load commit files') })
         }
         return
       }
@@ -7062,7 +7579,9 @@ export function createCodexBridgeMiddleware(): CodexBridgeMiddleware {
           const targetSha = await runCommandCapture('git', ['rev-parse', '--verify', `${sha}^{commit}`], { cwd: gitRoot })
           await runCommand('git', ['update-ref', toHeaderGitResetHistoryRef(branch, previousTip.trim()), previousTip.trim()], { cwd: gitRoot })
           await pruneHeaderGitResetHistoryRefs(gitRoot, branch)
-          await runCommand('git', ['reset', '--hard', targetSha.trim()], { cwd: gitRoot })
+          await withPreservedUntrackedFilesForGitTarget(gitRoot, targetSha.trim(), async () => {
+            await runCommand('git', ['reset', '--hard', targetSha.trim()], { cwd: gitRoot })
+          })
           setJson(res, 200, { data: await readGitHeaderState(gitRoot) })
         } catch (error) {
           setJson(res, 500, { error: getErrorMessage(error, 'Failed to reset branch to commit') })
